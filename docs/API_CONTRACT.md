@@ -1,14 +1,14 @@
-# Initial API Contract
+# UNBOUND AI API Contract
 
-This document describes intended endpoint interfaces. **No API routes or application entry point exist in the inspected repository yet.** These endpoints are planned and must not be treated as implemented until corresponding route code is added and verified. All JSON models below use Pydantic 2 shared contracts where a model exists.
+The task and health endpoints listed below are implemented by `backend/app/main.py`. Browser, document, and integrations endpoints remain future interfaces and are not currently exposed. All JSON task models use the shared Pydantic 2 contracts.
 
-Common error body (proposed): `{"detail": "human-readable explanation", "code": "stable_error_code"}`. Implementations may add request IDs, but should not expose credentials or internal stack traces.
+Errors use `{"detail":{"code":"stable_error_code","message":"human-readable explanation"}}`. Responses must not expose credentials or internal stack traces.
 
 ## Health
 
 | Method / path | Purpose | Request | Response | Errors / approval |
 |---|---|---|---|---|
-| `GET /api/health` | Report service health. | None | Not yet modeled; proposed `{"status":"ok"}`. | `503` if unavailable. No approval. |
+| `GET /api/health` | Report service health without exposing credentials. | None | `{"status":"ok","llm_configured":boolean,"tools_registered":boolean,"registered_tools_count":integer}` | `200`, including when no LLM is configured. No approval. |
 
 ## Tasks
 
@@ -16,11 +16,34 @@ Common error body (proposed): `{"detail": "human-readable explanation", "code": 
 |---|---|---|---|---|
 | `POST /api/tasks` | Create a task from natural language and request execution preference. | `TaskCreateRequest` (`user_request`, `auto_execute=false` by default). | `TaskResponse` | `422` invalid request; `503` required LLM unavailable. Creating a task does not waive approvals. |
 | `GET /api/tasks/{task_id}` | Retrieve task state, plan, approvals, evidence, artifacts, and result. | UUID path parameter | `TaskResponse` | `404` unknown task. No approval. |
-| `POST /api/tasks/{task_id}/execute` | Start or continue eligible task steps. | No body defined in the initial contracts. | `TaskResponse` | `404` unknown task; `409` invalid state; `422` invalid transition. Mandatory step approvals remain required, including with `auto_execute=true`. |
-| `POST /api/tasks/{task_id}/cancel` | Request cancellation. | No body defined. | `TaskResponse` | `404` unknown task; `409` already terminal, if implementation chooses to reject it. No approval. |
+| `POST /api/tasks/{task_id}/execute` | Start or continue eligible task steps. | No body. | `TaskResponse` | `404` unknown task; state outcomes, including awaiting approval and verification attention, are returned in `TaskResponse`. Mandatory approvals remain required. |
+| `POST /api/tasks/{task_id}/cancel` | Request cancellation. | No body. | `TaskResponse` | `404` unknown task. Cancellation of terminal tasks is idempotent. No approval. |
 | `GET /api/tasks/{task_id}/events` | Retrieve ordered execution events. | UUID path parameter | `list[ExecutionEvent]` | `404` unknown task. No approval. |
+| `POST /api/tasks/{task_id}/approvals/{approval_id}` | Resolve one pending approval. | `{"decision":"APPROVED"}` or `{"decision":"REJECTED"}` | Updated `TaskResponse` | `404` unknown task or pending approval; `422` invalid decision. Approval does not start execution; call the execute endpoint explicitly. |
 
-Approval decision API shape is not included in the initial endpoint list; the task response exposes `pending_approvals: list[ApprovalRequest]`. The team must agree on an approval endpoint before implementing UI/API approval submission.
+Task creation invokes the configured LLM to understand intent and generate a plan. Missing LLM configuration or provider failure returns `503`. `auto_execute` defaults to false; when true, the existing executor is invoked and still enforces approval and verification. If no verifier exists, the executor leaves the task needing attention without invoking a tool.
+
+Errors use a `detail` object with a stable `code` and safe `message`. Invalid request bodies and path UUIDs return `422`; unknown tasks return `404`. Unexpected errors return a generic `500` response without a traceback.
+
+## Backend startup
+
+From the repository root, in PowerShell:
+
+```powershell
+cd backend
+$env:PYTHONPATH = (Resolve-Path ..).Path
+python -m uvicorn app.main:app --reload
+```
+
+`PYTHONPATH` includes the repository root because the existing orchestration modules import through the `backend.app` package.
+
+The API base URL is `http://127.0.0.1:8000/api`; interactive Swagger documentation is at `http://127.0.0.1:8000/docs`.
+
+LLM configuration is optional for application startup and required for task creation. Supported environment variables are `LLM_PROVIDER`, `LLM_MODEL`, optional `LLM_BASE_URL`, `OPENAI_API_KEY` or `LLM_API_KEY` for cloud providers, and `LLM_TIMEOUT_SECONDS`. Ollama uses `LLM_PROVIDER=ollama` and defaults to `http://localhost:11434/v1`. Credentials are never returned by the API.
+
+Task and approval state currently lives in process memory and is lost when the application restarts. The default runtime has no registered browser, document, context, or report tools; integrations must register real implementations before those capabilities are available.
+
+External actions already started by a registered callable may not be reversible. Cancellation prevents later steps, but cannot guarantee rollback of an in-flight browser or remote operation.
 
 ## Browser
 

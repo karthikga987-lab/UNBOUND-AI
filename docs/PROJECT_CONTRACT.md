@@ -8,7 +8,7 @@ UNBOUND AI is a general-purpose digital agent that learns reusable browser workf
 
 The backend is organized around shared Pydantic contracts (`backend/app/schemas/contracts.py`) and implementation modules with one-way dependencies:
 
-- API layer (planned): validates requests and returns shared response models.
+- API layer (`backend/app/main.py` and `backend/app/api/`): validates requests and returns shared response models; task state is currently in memory.
 - Orchestrator and LLM: interpret requests, plan only with registered tools, manage task state, approvals, execution, recovery, and synthesis.
 - Browser intelligence: browser control, recording, learned workflow storage/replay, locator fallback, verification, and downloads.
 - MCP/documents/context: MCP integrations, PDF/DOCX/TXT ingestion, document retrieval, relationships, and source provenance.
@@ -30,7 +30,7 @@ The shared schemas are leaf modules: they must not import implementation code fr
 - Use the shared models and enums as the interface between members. Do not define parallel API/task/tool models in feature modules.
 - `ToolDefinition` is serializable metadata. The registered callable, schemas/validators, and runtime state belong in the tool registry.
 - Browser and MCP integrations register capabilities; the planner can select only capabilities actually registered at runtime.
-- API endpoints described in `API_CONTRACT.md` are target interfaces, not proof that routes exist. Implementations must be checked in code.
+- The health and task/approval endpoints listed as implemented in `API_CONTRACT.md` are available. Browser, document, and integration endpoints remain future interfaces; implementations must be checked in code.
 - `TaskStep.step_id` and workflow-local `step_id` are stable strings. Task, event, evidence, workflow, approval, and tool-call identifiers are UUIDs.
 
 ## Shared data-contract rules

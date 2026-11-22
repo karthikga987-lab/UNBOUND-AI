@@ -20,6 +20,32 @@ Tools are the only execution boundary available to the planner and executor. Too
 
 The orchestrator registry owns a separate runtime registration that binds a `ToolDefinition` to a Pydantic input model and a callable. The callable interface is `execute(validated_arguments, tool_call) -> ToolResult` (a JSON-compatible mapping may be normalized to `ToolResult`). The `ToolCall` context supplies task/step IDs so adapters can attach evidence to the correct task. Registration rejects duplicate/unknown names and rejects a published `input_schema` that differs from the input model's generated JSON schema. Listing tools returns definitions, not executable objects. The planner receives only registered definitions and may not invent tools.
 
+The shared registry is available to integration modules at `app.state.runtime.registry` (or on an injected `TaskRuntime` before `create_app(runtime)`). Register real adapters during application composition/startup, before serving requests. Do not register placeholder callables. Example adapter setup:
+
+```python
+from pydantic import BaseModel
+from backend.app.schemas.contracts import ToolCall, ToolDefinition, ToolResult
+
+class SearchInput(BaseModel):
+    query: str
+
+def search_documents(arguments: SearchInput, call: ToolCall) -> ToolResult:
+    # Call the real document service and return actual results/evidence.
+    ...
+
+runtime.registry.register(
+    ToolDefinition(
+        tool_name="document.search",
+        description="Search indexed documents",
+        input_schema=SearchInput.model_json_schema(),
+    ),
+    SearchInput,
+    search_documents,
+)
+```
+
+Browser and MCP modules should use the same registration pattern with their agreed tool names and input models. `TaskRuntime` accepts a verifier callable as `verifier(tool_name, expected_outcome, tool_result) -> bool`; it is passed to `TaskExecutor` at runtime construction. Configure it with observable checks backed by real adapter results/evidence. Without a verifier the executor does not invoke tools; do not make a verifier return true solely because a callable returned successfully.
+
 ## Call and result lifecycle
 
 1. Build a `ToolCall` with UUID `tool_call_id`, `task_id`, stable `step_id`, registered `tool_name`, and JSON `arguments`.
