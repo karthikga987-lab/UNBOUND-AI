@@ -69,4 +69,4 @@ External actions already started by a registered callable may not be reversible.
 |---|---|---|---|---|
 | `GET /api/integrations` | List configured integrations and availability without exposing secrets. | None | No shared integration response model yet. | `503` integration state unavailable. No approval. |
 
-The team should add request/response contracts before implementing the browser, document, approval, and integration endpoints. Do not create placeholder routes to match this document.
+The team should add request/response contracts before implementing the browser, document, and integration endpoints. The task approval endpoint is implemented above. Do not create placeholder routes to match this document.

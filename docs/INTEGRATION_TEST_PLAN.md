@@ -1,0 +1,71 @@
+# UNBOUND AI End-to-End Integration Test Plan
+
+## Scope and implementation status
+
+This plan follows [`DEMO_SCENARIO.md`](DEMO_SCENARIO.md). The current branch implements intent/planning, the task API, shared Pydantic contracts, in-memory task management, registered-tool execution, approvals, verification, event history, evidence retention and recovery. The checkout has no `frontend/`, `backend/app/browser/`, `backend/app/mcp/`, `backend/app/documents/`, or `backend/app/intelligence/` modules. Browser recording/replay/download, upload/PDF/spreadsheet extraction, context relationships, cross-source comparison, report generation UI, and end-to-end frontend behavior are planned and not currently demonstrated.
+
+The test matrix below is an executable acceptance plan for integration day. Rows needing absent modules are **blocked pending the owning member's real implementation**. Do not substitute fake tool behavior in the flagship rehearsal. Unit and API tests may use fakes.
+
+## Responsibility matrix
+
+| Member | Owns / supplies | Integration responsibility |
+|---|---|---|
+| 1 — Frontend | `frontend/` React/Tailwind UI (not present in this checkout) | Call implemented task/health/approval endpoints; display TaskResponse, ExecutionEvent, evidence and task status accurately; implement upload/workflow UI only against member-owned APIs when available. |
+| 2 — Browser | `backend/app/browser/` (not present) | Supply real browser.navigate/click/fill/record/replay/download adapters, workflow persistence/parameters, observable post-action state and browser-specific verifiers. |
+| 3 — Orchestration | API, planner, runtime, executor, safety and contracts | Maintain API/runtime integration; ensure only registered tools plan/execute; approval, verifier, cancellation and event/evidence semantics; coordinate integration and run this plan. |
+| 4 — MCP/docs/context | `backend/app/mcp/`, `documents/`, `intelligence/` (not present) | Supply real upload, PDF/spreadsheet extraction, document search, context retrieval/relationships, provenance and tool-specific verifiers. |
+
+## Test matrix
+
+Contract shorthand: task create input is `TaskCreateRequest(user_request, auto_execute=false)`. Responses are `TaskResponse`; plans are `TaskStep` with string `step_id`, registered `tool_name`, dict `input`, expected outcome, status and approval flag. Tool calls use `ToolCall(task_id, step_id, tool_name, arguments)` and callable signature `execute(validated_arguments, tool_call) -> ToolResult`. Events are `ExecutionEvent`; evidence is `EvidenceItem` with task/source provenance. Runtime APIs are `TaskRuntime.register_tool(definition, input_model, execute, verifier=None)` and `TaskRuntime.configure_verifier(tool_name, verifier)`. Verifier signature is `(tool_name, expected_outcome, tool_result) -> bool`.
+
+| ID / stage | Owner | Preconditions and input | Expected tool calls | Expected task status and events | Evidence / verification | Failure conditions |
+|---|---|---|---|---|---|---|
+| IT-01 Basic task submission | 1 + 3 | API/runtime available; configured test provider; request “Find the latest synthetic quarterly report.” | None at create when `auto_execute=false` | CREATED (or NEEDS_ATTENTION if plan needs clarification); `task.created`; valid plan returned | No evidence yet; check UUID4, shared contract serialization and step IDs | LLM missing gives safe 503; malformed request 422; no invented tools/inputs |
+| IT-02 Multi-step plan | 3 | Register real tool metadata for each planned capability; request synthetic report retrieval, download and comparison | Planner names only registered tools in required order | CREATED; plan steps PENDING | Inputs validate against registered Pydantic models | Unregistered capability, duplicate step IDs, or invalid inputs accepted |
+| IT-03 Missing information | 3 + 1 | Request omits an essential parameter (e.g. which synthetic organization); fake provider only in component test | No dependent action | NEEDS_ATTENTION; planning/missing-information state visible | Missing value stated; no evidence expected | Planner invents parameter or executor runs dependent action |
+| IT-04 Browser navigation | 2 + 3 | Browser session and real navigate adapter/verifier registered; safe synthetic fixture URL | `browser.navigate` | EXECUTING → VERIFYING → COMPLETED if observable URL/title matches | BROWSER `EvidenceItem` identifies fixture URL and observed page; verifier checks browser observation | Adapter return alone marked complete; wrong page accepted; evidence source absent |
+| IT-05 Workflow record and replay | 2 + 3 | User teaches fixture workflow; stored workflow and parameter schema available | `browser.record`, then `browser.replay` | Recording outcome represented by browser module; replay task pauses AWAITING_APPROVAL where required or completes verified steps | WORKFLOW/BROWSER evidence and per-step observations | Untrusted page content treated as instruction; hidden replay side effects bypass approval; workflow parameters invented |
+| IT-06 Report download | 2 + 3 | Fixture site exposes a synthetic report; download tool registered | `browser.download` | COMPLETED only after file existence/type/content check | BROWSER evidence with fixture URL; artifact path/reference retained | Empty, stale, or unrelated file considered verified |
+| IT-07 Document upload | 4 + 1 | Synthetic PDF and spreadsheet fixtures; real upload/ingestion service available | `document.upload` (if exposed as a task tool); UI upload path per Member 4 contract | Task/API outcome reflects ingestion success or safe failure | DOCUMENT evidence includes source filename/path and extraction provenance | Unsupported/corrupt file silently accepted; partial ingestion hidden |
+| IT-08 PDF extraction | 4 | Synthetic PDF fixture with known rows/values and page references | `document.upload` then retrieval tool(s) | Extraction completion is not conflated with task completion | DOCUMENT evidence includes page/excerpt and supports_claim | Wrong page/value, missing provenance, fabricated extraction |
+| IT-09 Spreadsheet extraction | 4 | Synthetic XLSX/CSV fixture with sheet, row and values known | `document.upload` then retrieval tool(s) | Retrieval completes only after expected sheet/row values verified | DOCUMENT evidence identifies filename, sheet/row in excerpt or source reference | Wrong sheet/row or spreadsheet formula/value ambiguity not disclosed |
+| IT-10 Context retrieval | 4 + 3 | Documents indexed; context tool and tool-specific verifier registered | `context.retrieve` | VERIFIED step only if returned context supports expected outcome | CONTEXT/DOCUMENT evidence preserves underlying source links | Context answer lacks citations or verifier trusts success flag only |
+| IT-11 Cross-document comparison | 3 + 4 | Website report and both synthetic documents retrieved; known comparison fixture | Relevant browser/document/context tools; comparison/report tool only if registered | Task completion after comparison claims independently checked | Evidence references all compared values and conflicting sources | Unsupported resolution, missing conflict, or model inference presented as verified fact |
+| IT-12 Final report generation | 3 + 4 + 1 | Evidence and verified comparison available; real `report.generate` registered if used | `report.generate` | COMPLETED only on independent artifact/content verification | REPORT evidence/artifact cites source evidence IDs | Report includes unsupported fact, fabricated citation, or missing artifact marked success |
+| IT-13 Evidence provenance | 3 + 4 + 2 | Any tool returns evidence for the current task | Tool call followed by verification | Evidence retained on success and failed verification | Every EvidenceItem task_id matches; event evidence_ids link; source type/name/path or URL is traceable | Cross-task evidence accepted; evidence retention implies success |
+| IT-14 Approval and rejection | 3 + 1 + 2 | Sensitive synthetic action in a registered tool; call execute then resolve approval | Sensitive callable not invoked before approval; after APPROVED, explicit execute invokes once; REJECTED never invokes | AWAITING_APPROVAL; approval event; approved step executes only after separate execute request; rejected step SKIPPED/NEEDS_ATTENTION | ApprovalRequest binds exact task/step/tool/arguments; audit event retained | `auto_execute` bypass, approval reuse, rejection executes, approval call auto-runs task |
+| IT-15 Failed verification | 3 + tool owner | Tool returns success-shaped result but verifier returns false or raises | Exactly one tool call | FAILED; `verification.failed`; never COMPLETED | Valid tool evidence retained and linked, explicitly not proof of success | Result JSON flag or ToolResult.success substitutes for verifier |
+| IT-16 Cancellation | 1 + 3 + tool owner | Multi-step task; cancel before next step; separate test cancels before execution claim | No later action invoked; already-started external call may finish | CANCELLED event/status; completed earlier work retained | Evidence retained for completed work | Claim cancellation reverses external action or later step runs |
+| IT-17 Recovery | 3 + tool owner | Recoverable failure after an earlier verified step | Resume retries only failed/pending work | Failed task remains failed until explicit resume; then final status from retry | Completed step/evidence preserved; failed evidence remains attributable | Completed step repeated or failure erased without attempt |
+| IT-18 Frontend status updates | 1 + 3 | UI connected to API; delayed fake/local adapter only in component test | Poll task retrieval and events; approve/reject/cancel as explicit requests | UI tracks CREATED, EXECUTING, VERIFYING, AWAITING_APPROVAL, NEEDS_ATTENTION, FAILED, COMPLETED, CANCELLED | Render event ordering and evidence refs from contracts | UI invents status, hides failure, or treats approval as execution |
+
+## API and runtime integration contract
+
+| Boundary | Actual interface / test assertion |
+|---|---|
+| React → FastAPI | Implemented: `GET /api/health`; `POST /api/tasks` with `TaskCreateRequest`; `GET /api/tasks/{task_id}`; `POST /api/tasks/{task_id}/execute`; `POST /api/tasks/{task_id}/cancel`; `GET /api/tasks/{task_id}/events`; `POST /api/tasks/{task_id}/approvals/{approval_id}` with `{"decision":"APPROVED"|"REJECTED"}`. No browser/document upload API routes exist in this checkout. |
+| FastAPI → runtime | Every route reads the one `request.app.state.runtime`; API tests use `create_app(runtime)` for injection. |
+| Runtime → registry | `runtime.register_tool(ToolDefinition, InputModel, execute, verifier=None)`. Registry validates agreed tool name, callable, Pydantic model and exact generated JSON schema. `runtime.configure_verifier(tool_name, verifier)` updates the executor; unknown names fail. |
+| Registry → adapter | `execute(validated_arguments, tool_call) -> ToolResult` (JSON-compatible dict may be normalized). ToolCall supplies UUID task ID, string step ID, tool name and arguments. |
+| Executor → verifier | Per-tool verifier takes precedence over constructor-level shared fallback: `(tool_name, expected_outcome, ToolResult) -> bool`. Missing verifier blocks invocation; false/exception fails the step. Configuration updates wait for active executor runs. Register adapters during startup; concurrent registry mutation while planning/execution is unsupported. |
+| Tool result → evidence | Return `ToolResult(success, data, error, evidence=[EvidenceItem(...)])`; every evidence task_id must match ToolCall.task_id. Preserve source type/name/URL or file_path/excerpt/retrieved_at/supports_claim. |
+| Events → UI timeline | `GET /api/tasks/{task_id}/events` returns ordered `ExecutionEvent` values with task_id, optional step_id, event_type, status, timestamp and evidence_ids. Unknown task returns 404. |
+
+## Synthetic test fixture set
+
+All values below are invented for integration testing and must be labeled synthetic in UI/test outputs. They are not claims about any real organization.
+
+- **User request:** “Using the saved Synthetic Metrics Portal workflow, retrieve the latest synthetic Q2 2025 energy report, compare its North Campus usage with the two uploaded synthetic files, and produce a cited summary. Do not submit or send anything.”
+- **Browser workflow:** `synthetic_metrics_latest_report`, start URL `https://demo.invalid/synthetic/metrics`, one read-only navigation/search step and one verified report-open step. Test adapter must point only to a controlled local fixture or approved test site, never a production system.
+- **Download fixture:** `synthetic_q2_2025_energy.csv`, row `North Campus, 1200 kWh`, report version `2025-07-15` (synthetic fixture timestamp).
+- **Document A:** `synthetic_facilities_note.pdf`, excerpt “North Campus Q2 usage: 1,180 kWh” (synthetic).
+- **Document B:** `synthetic_energy_ledger.xlsx`, `Q2` sheet, North Campus row `1,200 kWh` (synthetic).
+- **Expected comparison:** portal and ledger agree at 1,200 kWh; PDF is 20 kWh lower. Report this as a source discrepancy; do not choose which source is authoritative without an explicit rule/evidence.
+- **Expected evidence refs:** distinct EvidenceItem IDs for portal report (BROWSER), PDF (DOCUMENT, page reference in excerpt/source), spreadsheet (DOCUMENT, sheet/row in excerpt/source); comparison/report events link their IDs. Synthetic identifiers must be visibly marked `SYNTHETIC` in fixtures/results.
+
+## Acceptance gate
+
+Do not call the complete flagship demo accepted until all critical criteria pass with real registered modules: frontend submission; valid registered-tool plan; real tool execution; mandatory approval and rejection behavior; independent verification; no success after failed verification; traceable evidence; accurate frontend task/event states; evidence-grounded final report; and no fabricated sources/results. Unit fakes prove orchestration behavior only and do not satisfy real integration acceptance.
+
+Critical blockers today: browser workflow/controller/download implementation; document upload, PDF and spreadsheet ingestion; context retrieval/comparison/report implementations; a verifier bound to each real tool; and a frontend (no `frontend/` directory found in this checkout).
