@@ -1,122 +1,122 @@
-import { useState } from 'react'
-import heroImg from './assets/hero.png'
-import reactLogo from './assets/react.svg'
-import viteLogo from './assets/vite.svg'
-import './App.css'
+import { useCallback, useEffect, useState } from 'react'
+import { api, USE_MOCK } from './api'
+import { TaskStatus } from './api/contracts'
+import ChatPanel from './components/ChatPanel'
+import DataPanel from './components/DataPanel'
+import TaskWorkspace from './components/TaskWorkspace'
+import WorkflowPanel from './components/WorkflowPanel'
+import { Card, EmptyState, StatusBadge } from './components/ui'
 
-function App() {
-  const [count, setCount] = useState(0)
+const TABS = [
+  { id: 'workflows', label: 'Workflows' },
+  { id: 'data', label: 'Connected data' },
+]
+
+export default function App() {
+  const [history, setHistory] = useState([])
+  const [activeTaskId, setActiveTaskId] = useState(null)
+  const [tab, setTab] = useState('workflows')
+  const [health, setHealth] = useState('checking')
+
+  useEffect(() => {
+    let alive = true
+    api.health().then(
+      () => alive && setHealth('online'),
+      () => alive && setHealth('offline'),
+    )
+    return () => {
+      alive = false
+    }
+  }, [])
+
+  const trackTask = useCallback((task) => {
+    setHistory((prev) => [
+      ...prev.filter((item) => item.task_id !== task.task_id),
+      { task_id: task.task_id, user_request: task.user_request, status: task.status },
+    ])
+    setActiveTaskId(task.task_id)
+  }, [])
+
+  const handleSubmit = useCallback(
+    async (text, autoExecute) => {
+      const task = await api.createTask(text, autoExecute)
+      trackTask(task)
+      if (autoExecute && task.status === TaskStatus.CREATED) await api.executeTask(task.task_id)
+    },
+    [trackTask],
+  )
+
+  const handleTaskChange = useCallback((task) => {
+    setHistory((prev) => {
+      const item = prev.find((h) => h.task_id === task.task_id)
+      if (!item || item.status === task.status) return prev
+      return prev.map((h) => (h.task_id === task.task_id ? { ...h, status: task.status } : h))
+    })
+  }, [])
 
   return (
-    <>
-      <section id="center">
-        <div className="hero">
-          <img src={heroImg} className="base" width="170" height="179" alt="" />
-          <img src={reactLogo} className="framework" alt="React logo" />
-          <img src={viteLogo} className="vite" alt="Vite logo" />
+    <div className="min-h-screen bg-slate-950 text-slate-100">
+      <header className="sticky top-0 z-10 border-b border-slate-800 bg-slate-950/80 backdrop-blur">
+        <div className="mx-auto flex max-w-[1600px] items-center justify-between gap-3 px-4 py-3">
+          <div className="flex items-center gap-3">
+            <div className="grid h-9 w-9 place-items-center rounded-lg bg-linear-to-br from-violet-500 to-cyan-400 font-black text-slate-950">U</div>
+            <div>
+              <h1 className="text-lg font-bold tracking-tight">
+                UNBOUND <span className="text-violet-400">AI</span>
+              </h1>
+              <p className="hidden text-xs text-slate-400 sm:block">Learns workflows · connects information · verifies outcomes</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2 text-xs">
+            {USE_MOCK && <span className="rounded-full border border-amber-500/30 bg-amber-500/15 px-2 py-0.5 text-amber-300">Mock data</span>}
+            <span className="hidden text-slate-400 sm:inline">Backend</span>
+            <StatusBadge status={health} />
+          </div>
         </div>
-        <div>
-          <h1>Get started</h1>
-          <p>
-            Edit <code>src/App.jsx</code> and save to test <code>HMR</code>
+      </header>
+
+      {health === 'offline' && !USE_MOCK && (
+        <div className="mx-auto max-w-[1600px] px-4 pt-4">
+          <p className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-200">
+            The backend is not reachable. Start it, or set VITE_USE_MOCK=true in frontend/.env.local to use mock data.
           </p>
         </div>
-        <button
-          type="button"
-          className="counter"
-          onClick={() => setCount((count) => count + 1)}
-        >
-          Count is {count}
-        </button>
-      </section>
+      )}
 
-      <div className="ticks"></div>
-
-      <section id="next-steps">
-        <div id="docs">
-          <svg className="icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#documentation-icon"></use>
-          </svg>
-          <h2>Documentation</h2>
-          <p>Your questions, answered</p>
-          <ul>
-            <li>
-              <a href="https://vite.dev/" target="_blank">
-                <img className="logo" src={viteLogo} alt="" />
-                Explore Vite
-              </a>
-            </li>
-            <li>
-              <a href="https://react.dev/" target="_blank">
-                <img className="button-icon" src={reactLogo} alt="" />
-                Learn more
-              </a>
-            </li>
-          </ul>
+      <main className="mx-auto grid max-w-[1600px] gap-4 p-4 lg:grid-cols-[minmax(0,1fr)_380px]">
+        <div className="min-w-0 space-y-4">
+          <ChatPanel history={history} activeTaskId={activeTaskId} onSelect={setActiveTaskId} onSubmit={handleSubmit} />
+          {activeTaskId ? (
+            <TaskWorkspace key={activeTaskId} taskId={activeTaskId} onTaskChange={handleTaskChange} />
+          ) : (
+            <Card title="Live execution">
+              <EmptyState title="No task running" hint="Send a request above or replay a saved workflow to see the plan, live steps, approvals and results here." />
+            </Card>
+          )}
         </div>
-        <div id="social">
-          <svg className="icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#social-icon"></use>
-          </svg>
-          <h2>Connect with us</h2>
-          <p>Join the Vite community</p>
-          <ul>
-            <li>
-              <a href="https://github.com/vitejs/vite" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#github-icon"></use>
-                </svg>
-                GitHub
-              </a>
-            </li>
-            <li>
-              <a href="https://chat.vite.dev/" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#discord-icon"></use>
-                </svg>
-                Discord
-              </a>
-            </li>
-            <li>
-              <a href="https://x.com/vite_js" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#x-icon"></use>
-                </svg>
-                X.com
-              </a>
-            </li>
-            <li>
-              <a href="https://bsky.app/profile/vite.dev" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#bluesky-icon"></use>
-                </svg>
-                Bluesky
-              </a>
-            </li>
-          </ul>
-        </div>
-      </section>
 
-      <div className="ticks"></div>
-      <section id="spacer"></section>
-    </>
+        <aside className="min-w-0 space-y-3">
+          <div className="flex rounded-lg bg-slate-900 p-1 ring-1 ring-slate-800">
+            {TABS.map((t) => (
+              <button
+                key={t.id}
+                type="button"
+                onClick={() => setTab(t.id)}
+                className={`flex-1 rounded-md px-3 py-1.5 text-sm font-medium transition ${tab === t.id ? 'bg-slate-700 text-white' : 'text-slate-400 hover:text-slate-200'}`}
+              >
+                {t.label}
+              </button>
+            ))}
+          </div>
+          {/* Both stay mounted so an in-progress recording is not lost when switching tabs. */}
+          <div className={tab === 'workflows' ? '' : 'hidden'}>
+            <WorkflowPanel onTaskStarted={trackTask} />
+          </div>
+          <div className={tab === 'data' ? '' : 'hidden'}>
+            <DataPanel />
+          </div>
+        </aside>
+      </main>
+    </div>
   )
 }
-
-export default App
