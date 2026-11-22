@@ -20,3 +20,4 @@ venv/
 # Generated files
 generated_reports/*
 connected_data/*
+document_storage/*

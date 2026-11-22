@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from backend.app.documents.extractor import extract_document, infer_file_type, MAX_FILE_SIZE_BYTES
+from backend.app.documents.models import ExtractionStatus
 from backend.app.documents.search import DocumentSearcher
 from backend.app.documents.store import DocumentStore
 from backend.app.intelligence.context import ContextIntelligence
@@ -130,6 +131,11 @@ def build_document_router(
             raise HTTPException(status_code=503, detail="Storage unavailable") from exc
 
         extraction = extract_document(content, document_id, filename)
+        if extraction.status == ExtractionStatus.FAILED:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid document content: {extraction.error}",
+            )
 
         try:
             store.save_extraction(

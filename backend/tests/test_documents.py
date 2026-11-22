@@ -721,3 +721,70 @@ class TestMVPWorkflow:
             assert ev.excerpt
             assert ev.supports_claim
             assert ev.task_id == task_id
+
+
+# ---------------------------------------------------------------------------
+# 16. FastAPI Endpoints
+# ---------------------------------------------------------------------------
+
+
+class TestFastAPIEndpoints:
+    @pytest.fixture
+    def client(self, tmp_path):
+        from fastapi.testclient import TestClient
+        from backend.app.api import create_app
+        app = create_app(storage_dir=tmp_path / "api_storage")
+        return TestClient(app)
+
+    def test_health(self, client):
+        resp = client.get("/api/health")
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "ok"}
+
+    def test_upload_txt_success(self, client):
+        files = {"file": ("notes.txt", b"UNBOUND AI strategic vision for 2024.", "text/plain")}
+        resp = client.post("/api/documents/upload", files=files)
+        assert resp.status_code == 201
+        data = resp.json()
+        assert data["original_filename"] == "notes.txt"
+        assert data["file_type"] == "txt"
+        assert data["extraction_status"] == "success"
+        assert "document_id" in data
+
+    def test_upload_unsupported_type(self, client):
+        files = {"file": ("malicious.exe", b"\x4d\x5a\x90", "application/octet-stream")}
+        resp = client.post("/api/documents/upload", files=files)
+        assert resp.status_code == 415
+
+    def test_upload_empty_file(self, client):
+        files = {"file": ("empty.txt", b"", "text/plain")}
+        resp = client.post("/api/documents/upload", files=files)
+        assert resp.status_code == 422
+
+    def test_upload_corrupt_pdf(self, client):
+        files = {"file": ("bad.pdf", b"NOT A VALID PDF FILE STREAM", "application/pdf")}
+        resp = client.post("/api/documents/upload", files=files)
+        assert resp.status_code == 422
+
+    def test_list_documents(self, client):
+        files = {"file": ("doc_a.txt", b"Content of Doc A", "text/plain")}
+        client.post("/api/documents/upload", files=files)
+        resp = client.get("/api/documents")
+        assert resp.status_code == 200
+        docs = resp.json()
+        assert len(docs) >= 1
+        assert docs[0]["original_filename"] == "doc_a.txt"
+
+    def test_search_documents(self, client):
+        files = {"file": ("finance.txt", b"Revenue reached $10 million in Q4 2024.", "text/plain")}
+        client.post("/api/documents/upload", files=files)
+        resp = client.post(
+            "/api/documents/search",
+            json={"query": "revenue million", "top_k": 3},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total"] >= 1
+        assert "results" in data
+        assert any("finance.txt" == r["filename"] for r in data["results"])
+

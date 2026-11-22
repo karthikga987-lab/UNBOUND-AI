@@ -108,7 +108,6 @@ def _extract_pdf(file_bytes: bytes, document_id: str) -> ExtractionResult:
                 _chunk_text(page_text, document_id, page=page_num + 1)
             )
 
-        doc.close()
         full_text = "\n\n".join(page_texts)
         status = ExtractionStatus.EMPTY if not full_text.strip() else ExtractionStatus.SUCCESS
         return ExtractionResult(
@@ -131,6 +130,11 @@ def _extract_pdf(file_bytes: bytes, document_id: str) -> ExtractionResult:
             status=ExtractionStatus.FAILED,
             error=f"Extraction error: {exc}",
         )
+    finally:
+        try:
+            doc.close()
+        except Exception:
+            pass
 
 
 def _extract_docx(file_bytes: bytes, document_id: str) -> ExtractionResult:
