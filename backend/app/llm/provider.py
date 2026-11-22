@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from typing import Any, Protocol
 
@@ -31,6 +32,12 @@ class OpenAICompatibleProvider:
     def __init__(self, *, base_url: str, model: str, api_key: str | None = None, timeout: float = 30.0) -> None:
         if not model:
             raise LLMConfigurationError("LLM_MODEL must be configured")
+        try:
+            timeout = float(timeout)
+        except (TypeError, ValueError) as exc:
+            raise LLMConfigurationError("LLM timeout must be a positive finite number of seconds") from exc
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise LLMConfigurationError("LLM timeout must be a positive finite number of seconds")
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
@@ -65,7 +72,13 @@ def get_provider_from_env() -> LLMProvider:
     if not name:
         raise LLMConfigurationError("No LLM provider configured; set LLM_PROVIDER and LLM_MODEL")
     model = os.getenv("LLM_MODEL", "").strip()
-    timeout = float(os.getenv("LLM_TIMEOUT_SECONDS", "30"))
+    raw_timeout = os.getenv("LLM_TIMEOUT_SECONDS", "30")
+    try:
+        timeout = float(raw_timeout)
+    except (TypeError, ValueError) as exc:
+        raise LLMConfigurationError("LLM_TIMEOUT_SECONDS must be a positive finite number") from exc
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise LLMConfigurationError("LLM_TIMEOUT_SECONDS must be a positive finite number")
     if name in {"openai", "openai-compatible", "cloud"}:
         base_url = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
         key = os.getenv("OPENAI_API_KEY") or os.getenv("LLM_API_KEY")

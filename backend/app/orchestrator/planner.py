@@ -8,8 +8,8 @@ from pydantic import BaseModel, Field, ValidationError
 
 from backend.app.llm.provider import LLMProvider, get_provider_from_env
 from backend.app.orchestrator.intent import TaskIntent, understand_intent
-from backend.app.orchestrator.models import TaskStep
 from backend.app.orchestrator.tool_registry import ToolRegistry
+from backend.app.schemas.contracts import TaskCreateRequest, TaskStep
 
 
 class PlanDraft(BaseModel):
@@ -27,10 +27,10 @@ class PlanError(ValueError):
     pass
 
 
-def generate_plan(request: str, registry: ToolRegistry, provider: LLMProvider | None = None) -> TaskPlan:
+def generate_plan(request: str | TaskCreateRequest, registry: ToolRegistry, provider: LLMProvider | None = None) -> TaskPlan:
     llm = provider or get_provider_from_env()
     intent = understand_intent(request, llm)
-    available = [{"name": t.name, "description": t.description, "input_schema": t.input_schema.model_json_schema(), "permissions": t.permissions or {}} for t in registry.list_tools()]
+    available = [{"name": t.tool_name, "description": t.description, "input_schema": t.input_schema, "requires_approval": t.requires_approval} for t in registry.list_tools()]
     if not available:
         return TaskPlan(intent=intent, steps=[], missing_information=intent.missing_information + ["No tools are currently registered to perform this task."])
     prompt = json.dumps({"intent": intent.model_dump(mode="json"), "registered_tools": available}, ensure_ascii=False)
@@ -42,6 +42,10 @@ def generate_plan(request: str, registry: ToolRegistry, provider: LLMProvider | 
         )
     except (ValidationError, ValueError) as exc:
         raise PlanError(f"Could not create a valid task plan: {exc}") from exc
+    step_ids = [step.step_id for step in draft.steps]
+    duplicates = sorted({step_id for step_id in step_ids if step_ids.count(step_id) > 1})
+    if duplicates:
+        raise PlanError(f"Planner returned duplicate step_id values: {', '.join(duplicates)}")
     combined_missing = list(dict.fromkeys(intent.missing_information + draft.missing_information))
     checked: list[TaskStep] = []
     for i, step in enumerate(draft.steps, 1):
@@ -55,7 +59,7 @@ def generate_plan(request: str, registry: ToolRegistry, provider: LLMProvider | 
             combined_missing.append(f"Please clarify the input for '{step.tool_name}' ({step.step_id}): {exc}")
             continue
         step.step_id = step.step_id or f"step_{i}"
-        step.requires_approval = step.requires_approval or bool((tool.permissions or {}).get("requires_approval"))
+        step.requires_approval = step.requires_approval or tool.requires_approval
         checked.append(step)
     if not combined_missing and not checked:
         raise PlanError("Planner returned no steps and no clarification request")

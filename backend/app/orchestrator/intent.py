@@ -6,6 +6,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from backend.app.llm.provider import LLMProvider, get_provider_from_env
+from backend.app.schemas.contracts import TaskCreateRequest
 
 
 class TaskIntent(BaseModel):
@@ -17,8 +18,8 @@ class TaskIntent(BaseModel):
     missing_information: list[str] = Field(default_factory=list)
 
 
-def understand_intent(request: str, provider: LLMProvider | None = None) -> TaskIntent:
-    text = request.strip()
+def understand_intent(request: str | TaskCreateRequest, provider: LLMProvider | None = None) -> TaskIntent:
+    text = (request.user_request if isinstance(request, TaskCreateRequest) else request).strip()
     if not text:
         raise ValueError("User request must not be empty")
     llm = provider or get_provider_from_env()
