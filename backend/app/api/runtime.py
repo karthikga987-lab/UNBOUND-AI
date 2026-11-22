@@ -4,10 +4,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable
 
+from pydantic import BaseModel
+
 from backend.app.llm.provider import LLMConfigurationError, LLMProvider, get_provider_from_env
 from backend.app.orchestrator.executor import TaskExecutor, Verifier
 from backend.app.orchestrator.task_manager import TaskManager
-from backend.app.orchestrator.tool_registry import ToolRegistry
+from backend.app.orchestrator.tool_registry import ToolCallable, ToolRegistry
+from backend.app.schemas.contracts import ToolDefinition
 
 
 @dataclass
@@ -45,4 +48,27 @@ class TaskRuntime:
 
     def registered_tools_count(self) -> int:
         return len(self.registry.list_tools())
+
+    def register_tool(
+        self,
+        definition: ToolDefinition,
+        input_model: type[BaseModel],
+        execute: ToolCallable,
+        verifier: Verifier | None = None,
+    ) -> None:
+        """Register a real adapter and optionally its tool-specific verifier.
+
+        A tool without a specific verifier can use the runtime's explicitly
+        configured shared verifier. Otherwise the executor will not invoke it.
+        """
+        if verifier is not None and not callable(verifier):
+            raise TypeError("Verifier must be callable")
+        self.registry.register(definition, input_model, execute)
+        if verifier is not None:
+            self.executor.configure_verifier(definition.tool_name, verifier)
+
+    def configure_verifier(self, tool_name: str, verifier: Verifier) -> None:
+        """Configure verification after initialization for a registered tool."""
+        self.registry.get_tool(tool_name)  # Fail clearly for misspelled/unavailable tools.
+        self.executor.configure_verifier(tool_name, verifier)
 

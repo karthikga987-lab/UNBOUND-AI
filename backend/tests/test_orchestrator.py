@@ -292,6 +292,22 @@ def test_verification_failure_retains_evidence_and_links_event():
     assert evidence_event.status != EventStatus.COMPLETED
 
 
+def test_verifier_exception_fails_task_and_retains_tool_evidence():
+    manager = TaskManager()
+    task = create_task(manager, "Find report", [search_step()])
+
+    def broken_verifier(tool_name, expected, result):
+        raise RuntimeError("verification backend unavailable")
+
+    result = TaskExecutor(manager, registry(), broken_verifier).run(task.task_id)
+    assert result.status == TaskStatus.FAILED
+    assert result.plan[0].status == StepStatus.FAILED
+    assert result.plan[0].verification["verified"] is False
+    assert len(result.evidence) == 1
+    assert result.evidence[0].task_id == result.task_id
+    assert manager.events(task.task_id)[-1].event_type == "verification.failed"
+
+
 def test_missing_verifier_leaves_task_needing_attention_without_calling_tool():
     calls = []
     manager = TaskManager()

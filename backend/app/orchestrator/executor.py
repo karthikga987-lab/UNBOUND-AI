@@ -1,6 +1,7 @@
 """Single-action observe/act/verify loop with per-task serialization and approval gates."""
 from __future__ import annotations
 
+from threading import Condition, RLock
 from typing import Callable
 from uuid import UUID
 
@@ -35,19 +36,46 @@ class TaskExecutor:
         self.manager = manager
         self.registry = registry
         self.verifier = verifier
+        self._tool_verifiers: dict[str, Verifier] = {}
+        self._configuration_condition = Condition(RLock())
+        self._active_runs = 0
+
+    def configure_verifier(self, tool_name: str, verifier: Verifier) -> None:
+        """Install or replace the verifier used for one registered tool."""
+        if not callable(verifier):
+            raise TypeError("Verifier must be callable")
+        self.registry.get_tool(tool_name)
+        with self._configuration_condition:
+            while self._active_runs:
+                self._configuration_condition.wait()
+            self._tool_verifiers[tool_name] = verifier
+
+    def verifier_for(self, tool_name: str) -> Verifier | None:
+        """Prefer a tool-specific verifier, falling back to the shared verifier."""
+        with self._configuration_condition:
+            return self._tool_verifiers.get(tool_name, self.verifier)
 
     def run(self, task_id: UUID4 | UUID | str, *, resume: bool = False) -> TaskResponse:
         # A second caller waits for the current run and then sees its persisted result.
         # Cancellation deliberately does not acquire this lock.
-        with self.manager.execution_lock(task_id):
-            return self._run_locked(task_id, resume=resume)
+        with self._configuration_condition:
+            self._active_runs += 1
+        try:
+            with self.manager.execution_lock(task_id):
+                return self._run_locked(task_id, resume=resume)
+        finally:
+            with self._configuration_condition:
+                self._active_runs -= 1
+                if self._active_runs == 0:
+                    self._configuration_condition.notify_all()
 
     def _run_locked(self, task_id: UUID4 | UUID | str, *, resume: bool) -> TaskResponse:
         task = self.manager.get(task_id)
         if task.status in {TaskStatus.CANCELLED, TaskStatus.COMPLETED}:
             return task
         if task.status == TaskStatus.NEEDS_ATTENTION:
-            if task.error != NO_VERIFIER_ERROR or self.verifier is None:
+            pending_step = next((step for step in task.plan if step.status not in {StepStatus.COMPLETED, StepStatus.SKIPPED}), None)
+            if task.error != NO_VERIFIER_ERROR or pending_step is None or self.verifier_for(pending_step.tool_name) is None:
                 return task
             task.status = TaskStatus.EXECUTING
             task.error = None
@@ -65,7 +93,8 @@ class TaskExecutor:
                 continue
 
             task.current_step = step.step_id
-            if self.verifier is None:
+            step_verifier = self.verifier_for(step.tool_name)
+            if step_verifier is None:
                 task.status = TaskStatus.NEEDS_ATTENTION
                 task.error = NO_VERIFIER_ERROR
                 self.manager.event(task, "verification.unavailable", EventStatus.NEEDS_ATTENTION, task.error, step.step_id)
@@ -144,7 +173,7 @@ class TaskExecutor:
             task.status = TaskStatus.VERIFYING
             self.manager.event(task, "verification.started", EventStatus.VERIFYING, "Checking expected outcome", step.step_id, evidence_ids)
             try:
-                verified = verify_result(step.tool_name, step.expected_outcome, result, self.verifier)
+                verified = verify_result(step.tool_name, step.expected_outcome, result, step_verifier)
             except Exception as exc:
                 step.verification = {"verified": False, "expected_outcome": step.expected_outcome, "error": f"Verifier error: {exc}"}
                 return self._fail_step(task_id, task, step, f"Outcome verification failed: {exc}", event_type="verification.failed")

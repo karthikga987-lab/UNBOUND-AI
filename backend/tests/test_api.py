@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
+import pytest
 
 from backend.app.api.runtime import TaskRuntime
 from backend.app.llm.provider import LLMConfigurationError
@@ -12,11 +15,13 @@ from backend.app.orchestrator.intent import TaskIntent
 from backend.app.orchestrator.planner import PlanDraft
 from backend.app.schemas.contracts import (
     ApprovalStatus,
+    TaskCreateRequest,
     TaskStep,
     ToolCall,
     ToolDefinition,
     ToolResult,
 )
+from backend.app.orchestrator.tool_registry import ToolUnavailableError
 
 
 class FakeProvider:
@@ -88,6 +93,116 @@ def test_task_creation_retrieval_and_shared_runtime_state():
     assert retrieved.json()["task_id"] == task_id
     assert len(retrieved.json()["plan"]) == 1
     assert client.get("/api/health").json()["registered_tools_count"] == 1
+
+
+def test_runtime_allows_late_tool_and_verifier_registration():
+    runtime = TaskRuntime()
+    calls = []
+    client = TestClient(create_app(runtime))
+
+    class SearchInput(BaseModel):
+        query: str
+
+    task = runtime.manager.create(TaskCreateRequest(user_request="Find the quarterly report"), [TaskStep(
+        step_id="search_report", tool_name="document.search", description="Search report",
+        input={"query": "quarterly report"}, expected_outcome="Report found",
+    )])
+    task_id = str(task.task_id)
+    runtime.register_tool(
+        ToolDefinition(tool_name="document.search", description="Search docs", input_schema=SearchInput.model_json_schema()),
+        SearchInput,
+        lambda arguments, call: calls.append(call) or ToolResult(success=True, data={"result_count": 1}),
+    )
+
+    blocked = client.post(f"/api/tasks/{task_id}/execute").json()
+    assert blocked["status"] == "needs_attention"
+    assert calls == []
+
+    runtime.configure_verifier("document.search", lambda tool, expected, result: result.data["result_count"] == 1)
+    completed = client.post(f"/api/tasks/{task_id}/execute").json()
+    assert completed["status"] == "completed"
+    assert len(calls) == 1
+    assert completed["plan"][0]["verification"]["verified"] is True
+
+
+def test_runtime_tool_specific_failed_verifier_prevents_completion():
+    runtime, calls = planned_runtime()
+    # Replace the executor verifier with a tool-specific strategy after initialization.
+    runtime.configure_verifier("document.search", lambda tool, expected, result: False)
+    client = TestClient(create_app(runtime))
+    task_id = client.post("/api/tasks", json={"user_request": "Find the quarterly report"}).json()["task_id"]
+    result = client.post(f"/api/tasks/{task_id}/execute").json()
+    assert result["status"] == "failed"
+    assert result["plan"][0]["status"] == "failed"
+    assert len(calls) == 1
+
+
+def test_tool_specific_verifier_precedes_shared_verifier():
+    runtime, calls = planned_runtime(verifier=lambda tool, expected, result: False)
+    runtime.configure_verifier("document.search", lambda tool, expected, result: True)
+    client = TestClient(create_app(runtime))
+    task_id = client.post("/api/tasks", json={"user_request": "Find the quarterly report"}).json()["task_id"]
+    result = client.post(f"/api/tasks/{task_id}/execute").json()
+    assert result["status"] == "completed"
+    assert len(calls) == 1
+
+
+def test_verifier_cannot_be_configured_for_unregistered_tool():
+    runtime = TaskRuntime(verifier=lambda tool, expected, result: True)
+    with pytest.raises(ToolUnavailableError):
+        runtime.configure_verifier("browser.navigate", lambda tool, expected, result: True)
+
+
+def test_concurrent_verifier_update_waits_until_active_run_finishes():
+    entered_tool, release_tool, update_started, update_finished = Event(), Event(), Event(), Event()
+    runtime = TaskRuntime()
+
+    class SearchInput(BaseModel):
+        query: str
+
+    calls = []
+
+    def execute(arguments, call):
+        calls.append(call)
+        if len(calls) == 1:
+            entered_tool.set()
+            assert release_tool.wait(3)
+        return ToolResult(success=True, data={"count": 1})
+
+    runtime.register_tool(
+        ToolDefinition(tool_name="document.search", description="Search", input_schema=SearchInput.model_json_schema()),
+        SearchInput,
+        execute,
+        verifier=lambda tool, expected, result: True,
+    )
+
+    def new_task():
+        return runtime.manager.create(TaskCreateRequest(user_request="Find a report"), [TaskStep(
+            step_id="find", tool_name="document.search", description="Find report",
+            input={"query": "report"}, expected_outcome="Report found",
+        )])
+
+    first = new_task()
+
+    def configure_failed_verifier():
+        update_started.set()
+        runtime.configure_verifier("document.search", lambda tool, expected, result: False)
+        update_finished.set()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        execution = pool.submit(runtime.executor.run, first.task_id)
+        assert entered_tool.wait(3)
+        update = pool.submit(configure_failed_verifier)
+        assert update_started.wait(3)
+        assert not update_finished.wait(0.05)
+        release_tool.set()
+        first_result = execution.result(timeout=3)
+        update.result(timeout=3)
+
+    second_result = runtime.executor.run(new_task().task_id)
+    assert first_result.status.value == "completed"
+    assert second_result.status.value == "failed"
+    assert len(calls) == 2
 
 
 def test_unknown_task_and_unknown_task_events_return_404():
