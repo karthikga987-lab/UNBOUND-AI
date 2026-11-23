@@ -15,6 +15,7 @@ const TABS = [
 export default function App() {
   const [history, setHistory] = useState([])
   const [activeTaskId, setActiveTaskId] = useState(null)
+  const [activeTask, setActiveTask] = useState(null) // latest polled copy, used for voice narration
   const [tab, setTab] = useState('workflows')
   const [health, setHealth] = useState('checking')
 
@@ -35,6 +36,7 @@ export default function App() {
       { task_id: task.task_id, user_request: task.user_request, status: task.status },
     ])
     setActiveTaskId(task.task_id)
+    setActiveTask(task)
   }, [])
 
   const handleSubmit = useCallback(
@@ -42,11 +44,13 @@ export default function App() {
       const task = await api.createTask(text, autoExecute)
       trackTask(task)
       if (autoExecute && task.status === TaskStatus.CREATED) await api.executeTask(task.task_id)
+      return task
     },
     [trackTask],
   )
 
   const handleTaskChange = useCallback((task) => {
+    setActiveTask(task)
     setHistory((prev) => {
       const item = prev.find((h) => h.task_id === task.task_id)
       if (!item || item.status === task.status) return prev
@@ -85,7 +89,13 @@ export default function App() {
 
       <main className="mx-auto grid max-w-[1600px] gap-4 p-4 lg:grid-cols-[minmax(0,1fr)_380px]">
         <div className="min-w-0 space-y-4">
-          <ChatPanel history={history} activeTaskId={activeTaskId} onSelect={setActiveTaskId} onSubmit={handleSubmit} />
+          <ChatPanel
+            history={history}
+            activeTaskId={activeTaskId}
+            activeTask={activeTask?.task_id === activeTaskId ? activeTask : null}
+            onSelect={setActiveTaskId}
+            onSubmit={handleSubmit}
+          />
           {activeTaskId ? (
             <TaskWorkspace key={activeTaskId} taskId={activeTaskId} onTaskChange={handleTaskChange} />
           ) : (
