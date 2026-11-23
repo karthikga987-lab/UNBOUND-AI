@@ -4,13 +4,13 @@ __pycache__/
 *.pyd
 .pytest_cache/
 .venv/
+.venv-wake/
+.venv-wake-train/
 venv/
 
 # Environment secrets
 .env
 .env.*
-
-# Keep example environment files
 !.env.example
 
 # IDE
@@ -20,3 +20,8 @@ venv/
 # Generated files
 generated_reports/*
 connected_data/*
+document_storage/*
+backend/models/wake-word/*.ppn
+backend/models/wake-word/*.onnx
+backend/models/wake-word/features/
+data/wake-word/

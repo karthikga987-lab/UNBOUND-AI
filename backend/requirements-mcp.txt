@@ -1,0 +1,2 @@
+# Optional dependency for the explicitly launched standalone stdio MCP server.
+mcp>=1.0,<2
