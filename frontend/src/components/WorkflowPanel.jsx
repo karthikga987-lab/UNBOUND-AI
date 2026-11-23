@@ -23,8 +23,19 @@ export default function WorkflowPanel({ onTaskStarted }) {
   }, [])
 
   useEffect(() => {
-    load()
-  }, [load])
+    let active = true
+    api.listWorkflows().then(
+      (data) => {
+        if (!active) return
+        setWorkflows(asList(data, 'workflows'))
+        setLoadState({ loading: false, error: null })
+      },
+      (error) => active && setLoadState({ loading: false, error }),
+    )
+    return () => {
+      active = false
+    }
+  }, [])
 
   const reload = () => {
     setLoadState({ loading: true, error: null })

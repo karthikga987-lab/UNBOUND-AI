@@ -22,16 +22,25 @@ const BADGE = {
   skipped: 'bg-zinc-500/15 text-zinc-300 ring-zinc-500/30',
   not_configured: 'bg-zinc-500/15 text-zinc-300 ring-zinc-500/30',
   unavailable: 'bg-zinc-500/15 text-zinc-300 ring-zinc-500/30',
+  initializing: 'bg-sky-500/15 text-sky-300 ring-sky-500/30',
+  waiting_for_approval: 'bg-amber-500/15 text-amber-300 ring-amber-500/30',
+  paused: 'bg-amber-500/15 text-amber-300 ring-amber-500/30',
+  cancelling: 'bg-orange-500/15 text-orange-300 ring-orange-500/30',
+  connecting: 'bg-sky-500/15 text-sky-300 ring-sky-500/30',
+  reconnecting: 'bg-orange-500/15 text-orange-300 ring-orange-500/30',
+  disconnected: 'bg-rose-500/15 text-rose-300 ring-rose-500/30',
+  ended: 'bg-zinc-500/15 text-zinc-300 ring-zinc-500/30',
+  passed: 'bg-emerald-500/15 text-emerald-300 ring-emerald-500/30',
 }
-const LIVE = new Set(['running', 'executing', 'verifying', 'planning', 'recording', 'checking'])
+const LIVE = new Set(['running', 'executing', 'verifying', 'planning', 'recording', 'checking', 'initializing', 'connecting', 'reconnecting', 'cancelling'])
 
-export function StatusBadge({ status }) {
-  const label = String(status ?? 'unknown')
-  const cls = BADGE[label] ?? 'bg-slate-500/15 text-slate-300 ring-slate-500/30'
+export function StatusBadge({ status, label }) {
+  const key = String(status ?? 'unknown')
+  const cls = BADGE[key] ?? 'bg-slate-500/15 text-slate-300 ring-slate-500/30'
   return (
     <span className={`inline-flex items-center gap-1.5 whitespace-nowrap rounded-full px-2 py-0.5 text-xs font-medium ring-1 ring-inset ${cls}`}>
-      {LIVE.has(label) && <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-current" />}
-      {label.replaceAll('_', ' ')}
+      {LIVE.has(key) && <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-current" />}
+      {label ?? key.replaceAll('_', ' ')}
     </span>
   )
 }

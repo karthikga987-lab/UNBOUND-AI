@@ -12,7 +12,7 @@ const STEP_ICON = {
   skipped: { icon: '–', cls: 'border-zinc-600 text-zinc-400' },
 }
 
-export default function TimelinePanel({ task, events, error, busy, actionError, onExecute, onCancel, onDecide }) {
+export default function TimelinePanel({ task, events, error, busy, actionError, onExecute, onCancel, onDecide, onOpenLive }) {
   const counts = task.plan.reduce((acc, s) => ({ ...acc, [s.status]: (acc[s.status] ?? 0) + 1 }), {})
   const stepIds = new Set(task.plan.map((s) => s.step_id))
   const approvalsByStep = Object.fromEntries(task.pending_approvals.map((a) => [a.step_id, a]))
@@ -26,6 +26,11 @@ export default function TimelinePanel({ task, events, error, busy, actionError, 
       actions={
         <>
           <StatusBadge status={task.status} />
+          {onOpenLive && (
+            <Button size="sm" variant="secondary" onClick={onOpenLive}>
+              Watch live
+            </Button>
+          )}
           {canExecute(task.status) && (
             <Button size="sm" onClick={onExecute} loading={busy === 'execute'}>
               {task.status === TaskStatus.CREATED ? 'Run plan' : 'Resume'}

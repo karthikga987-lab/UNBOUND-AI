@@ -1,1 +1,13 @@
 @import "tailwindcss";
+
+/* Live View: one-shot ripple at a real click location (re-keyed per click event). */
+@keyframes click-ripple {
+  from { transform: scale(0.4); opacity: 0.9; }
+  to { transform: scale(2.4); opacity: 0; }
+}
+.click-ripple {
+  animation: click-ripple 0.9s ease-out forwards;
+}
+@media (prefers-reduced-motion: reduce) {
+  .click-ripple { animation: none; opacity: 0.6; }
+}

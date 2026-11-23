@@ -1,5 +1,7 @@
 // Real backend client. Endpoints follow docs/API_CONTRACT.md.
-export const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000').replace(/\/$/, '')
+// Default '' = same origin: the Vite dev server proxies /api to the backend (see vite.config.js),
+// which avoids CORS. Set VITE_API_BASE_URL only if the backend is served elsewhere with CORS enabled.
+export const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/$/, '')
 
 export class ApiError extends Error {
   constructor(message, { status, code } = {}) {
@@ -10,10 +12,12 @@ export class ApiError extends Error {
   }
 }
 
+// Backend errors are {"detail": {"code": "...", "message": "..."}}; FastAPI defaults may be a string or list.
 function formatDetail(detail) {
   if (!detail) return null
   if (typeof detail === 'string') return detail
-  if (Array.isArray(detail)) return detail.map((d) => d?.msg ?? JSON.stringify(d)).join('; ')
+  if (Array.isArray(detail)) return detail.map((d) => d?.msg ?? d?.message ?? JSON.stringify(d)).join('; ')
+  if (typeof detail.message === 'string') return detail.message
   return JSON.stringify(detail)
 }
 
@@ -26,7 +30,7 @@ async function request(path, { method = 'GET', body, formData } = {}) {
       body: formData ?? (body !== undefined ? JSON.stringify(body) : undefined),
     })
   } catch {
-    throw new ApiError(`Cannot reach the backend at ${API_BASE_URL}. Is it running?`, { status: 0, code: 'network_error' })
+    throw new ApiError(`Cannot reach the backend at ${API_BASE_URL || 'the /api proxy'}. Is it running?`, { status: 0, code: 'network_error' })
   }
   const text = await response.text()
   let data = null
@@ -36,7 +40,7 @@ async function request(path, { method = 'GET', body, formData } = {}) {
   if (!response.ok) {
     throw new ApiError(formatDetail(data?.detail) ?? `Request failed (${response.status})`, {
       status: response.status,
-      code: data?.code,
+      code: data?.detail?.code ?? data?.code,
     })
   }
   return data
@@ -52,9 +56,10 @@ export const realApi = {
   executeTask: (taskId) => request(`/tasks/${taskId}/execute`, { method: 'POST' }),
   cancelTask: (taskId) => request(`/tasks/${taskId}/cancel`, { method: 'POST' }),
 
-  // PROVISIONAL: approval endpoint is not in API_CONTRACT.md yet. Confirm path/body with Member 3.
+  // Implemented by Member 3 (feature/orchestration-engine): body {"decision": "APPROVED" | "REJECTED"}.
+  // Resolving an approval does NOT resume execution; callers must call executeTask afterwards.
   decideApproval: (taskId, approvalId, decision) =>
-    request(`/tasks/${taskId}/approvals/${approvalId}`, { method: 'POST', body: { decision } }),
+    request(`/tasks/${taskId}/approvals/${approvalId}`, { method: 'POST', body: { decision: String(decision).toUpperCase() } }),
 
   // PROVISIONAL request bodies: no shared request model yet.
   startRecording: ({ name, startUrl }) =>
