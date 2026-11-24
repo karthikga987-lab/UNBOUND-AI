@@ -189,6 +189,18 @@ class BrowserToolAdapter:
         """Return definitions, validators and callables for external registration."""
         return self._bindings
 
+    def cleanup_task(self, task_id: UUID) -> None:
+        """Discard task-owned recorder state during terminal task cleanup."""
+        if not isinstance(task_id, UUID) or task_id.version != 4:
+            return
+        with self._lock:
+            self._recorders.pop(task_id, None)
+
+    def cleanup_all(self) -> None:
+        """Discard recorder bookkeeping during application shutdown."""
+        with self._lock:
+            self._recorders.clear()
+
     def _make_bindings(self) -> tuple[BrowserToolBinding, ...]:
         methods = {
             "browser.navigate": self.navigate,
