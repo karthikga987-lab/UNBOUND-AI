@@ -20,3 +20,6 @@ venv/
 # Generated files
 generated_reports/*
 connected_data/*
+backend/generated_data/workflows/
+backend/generated_data/downloads/
+backend/generated_data/replay_state/
