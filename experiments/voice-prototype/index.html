@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>UNBOUND AI Voice Companion Prototype</title>
+  <style>
+    :root { color-scheme: dark; font-family: Segoe UI, system-ui, sans-serif; background: #10151d; color: #e7edf5; }
+    body { max-width: 960px; margin: 36px auto; padding: 0 20px; }
+    h1 { margin-bottom: 4px; } .subtle, .hint { color: #9eacbd; }
+    .card { background: #192331; border: 1px solid #2b3a4d; border-radius: 12px; padding: 18px; margin: 16px 0; }
+    label { display: block; margin: 10px 0 6px; }
+    input[type=url], input[type=text], input[type=date], input[type=time], textarea { box-sizing: border-box; width: 100%; border: 1px solid #40536b; background: #0f1722; color: #eff6ff; border-radius: 8px; padding: 10px; }
+    textarea { min-height: 110px; resize: vertical; }
+    button { border: 0; border-radius: 8px; padding: 10px 14px; margin: 5px 6px 5px 0; color: #08111b; background: #80c7ff; font-weight: 650; cursor: pointer; }
+    button.secondary { background: #b6c6d8; } button.danger { color: #fff; background: #a94452; }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 3px solid #ffd166; outline-offset: 2px; }
+    .status { font-weight: 700; letter-spacing: .08em; } .error { color: #ff9a9a; min-height: 1.3em; }
+    .toggle { display: inline-flex; align-items: center; gap: 8px; margin-right: 20px; }
+    #response { white-space: pre-wrap; min-height: 30px; }
+    .pre-wrap { white-space: pre-wrap; overflow-wrap: anywhere; }
+    .approval-card { border: 1px solid #865c38; border-radius: 8px; padding: 12px; margin: 10px 0; }
+    .reminder-row { border-top: 1px solid #40536b; padding: 8px 0; }
+    .approval-card pre { white-space: pre-wrap; overflow-wrap: anywhere; color: #c9d7e7; }
+    @media (max-width: 620px) { body { margin: 16px auto; padding: 0 12px; } .card { padding: 14px; } button { min-height: 44px; } }
+  </style>
+</head>
+<body>
+  <h1>UNBOUND AI <span class="subtle">Voice Companion</span></h1>
+  <p class="subtle">Push-to-talk prototype. Speech recognition runs in the browser; AI responses use the configured backend LLM.</p>
+
+  <section class="card" aria-label="Connection and controls">
+    <label for="apiBase">Backend base URL</label>
+    <input id="apiBase" type="url" value="http://127.0.0.1:8000" autocomplete="url">
+    <p><span class="status" id="state" role="status" aria-live="polite" aria-atomic="true">IDLE</span></p>
+    <p id="stateDetail" class="hint" aria-live="polite"></p>
+    <label class="toggle"><input id="recognitionEnabled" type="checkbox" checked> Enable browser speech recognition</label>
+    <label class="toggle"><input id="speechEnabled" type="checkbox" checked> Speak AI responses</label>
+    <div>
+      <button id="startButton">Start listening</button>
+      <button id="stopButton" class="secondary" disabled>Stop listening</button>
+      <button id="cancelRecordingButton" class="danger" disabled>Cancel recording</button>
+    </div>
+    <p class="hint">Microphone access starts only after you press Start listening. No background listening or task execution. Browser recognition may use an online service.</p>
+  </section>
+
+  <section class="card" aria-label="Experimental local wake word">
+    <h2>Experimental wake word</h2>
+    <p id="wakeWordState" role="status" aria-live="polite">Wake word is off. Start it explicitly; the local backend will open the microphone.</p>
+    <button id="wakeWordStartButton" class="secondary">Start local “Hey UNBOUND” listening</button>
+    <button id="wakeWordMuteButton" class="secondary">Mute wake word</button>
+    <button id="wakeWordEnableButton" class="secondary">Enable wake word</button>
+    <button id="wakeWordDisableButton" class="danger">Disable wake word</button>
+    <p class="hint">Wake detection uses a custom openWakeWord ONNX model through the local backend. It is opt-in; Start opens one local microphone stream and Stop/Mute releases it. No wake audio is uploaded or stored. After activation, existing browser speech recognition starts and may use an online service. The wake phrase does not authorize tasks. The custom Hey UNBOUND model is not yet trained or installed.</p>
+  </section>
+
+  <section class="card" aria-label="Conversation session">
+    <h2>Persistent conversation</h2>
+    <p class="hint">Session: <code id="sessionId">Loading…</code></p>
+    <button id="newConversationButton" class="secondary">New conversation</button>
+    <button id="deleteConversationButton" class="danger">Delete current conversation</button>
+    <h3>History</h3>
+    <div id="history" aria-live="polite" aria-atomic="false" class="pre-wrap">Loading history…</div>
+  </section>
+
+  <section class="card">
+    <label for="transcript">Transcript (editable before sending)</label>
+    <textarea id="transcript" aria-label="Editable voice transcript or message" placeholder="Speak or type a message here…"></textarea>
+    <p class="hint">Partial: <span id="partial" aria-live="polite"></span></p>
+    <button id="sendButton">Send to companion</button>
+    <button id="retryButton" class="secondary" disabled>Retry request</button>
+    <p class="error" id="error" role="alert"></p>
+  </section>
+
+  <section class="card">
+    <h2>Companion response</h2>
+    <div id="response" aria-live="polite"></div>
+    <button id="speakButton" class="secondary" disabled>Speak response</button>
+    <button id="stopSpeakingButton" class="danger" disabled>Stop speaking</button>
+  </section>
+
+  <section class="card" aria-label="Reminders">
+    <h2>Local reminders</h2>
+    <p class="hint">Reminders are separate from personal memory and tasks. New entries are proposals until you confirm them. Notifications require the UNBOUND Windows notification agent to be installed and running. Reminders remain saved if the agent is unavailable.</p>
+    <p id="reminderAgentStatus" role="status" aria-live="polite">Checking Windows notification agent…</p>
+    <label for="reminderTitle">Reminder</label>
+    <input id="reminderTitle" type="text" maxlength="200" placeholder="Finish project presentation">
+    <label for="reminderDate">Due date (your local date)</label>
+    <input id="reminderDate" type="date">
+    <label for="reminderTime">Time (optional)</label>
+    <input id="reminderTime" type="time">
+    <p>Time zone: <code id="reminderTimezone"></code></p>
+    <button id="saveReminderButton">Propose reminder</button>
+    <button id="cancelReminderEditButton" class="secondary" hidden>Cancel edit</button>
+    <p id="reminderStatus" role="status" aria-live="polite"></p>
+    <div id="reminderList" aria-live="polite"></div>
+  </section>
+
+  <section class="card" aria-labelledby="taskHeading">
+    <h2 id="taskHeading">Optional task handoff</h2>
+    <p class="hint">General conversation remains response-only. An explicit read, analyse, summarise or review request with an absolute Windows file path is routed here to prepare the existing local-file task. Preparation never reads the file; starting execution requests approval, and the approved read requires a separate explicit approval decision.</p>
+    <button id="prepareTaskButton" class="secondary">Classify request and prepare plan</button>
+    <p id="taskIntent" role="status" aria-live="polite"></p>
+    <p id="taskReply" class="pre-wrap"></p>
+    <div id="taskOutput" class="pre-wrap">No task has been prepared.</div>
+    <div id="approvalList"></div>
+    <label><input id="executeConsent" type="checkbox" disabled> I explicitly want to start this task now. Consequential steps can still pause for approval.</label>
+    <button id="executeTaskButton" disabled>Execute task (explicit)</button>
+    <h3>Task execution events</h3>
+    <div id="taskEvents" class="pre-wrap" aria-live="polite"></div>
+  </section>
+  <script src="wake-word-controller.js"></script>
+  <script src="voice.js"></script>
+</body>
+</html>

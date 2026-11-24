@@ -225,9 +225,10 @@ def _extract_docx(file_bytes: bytes, document_id: str) -> ExtractionResult:
 def _extract_txt(file_bytes: bytes, document_id: str) -> ExtractionResult:
     """Extract text from a plain text file."""
     try:
-        # Try UTF-8, then Latin-1 as fallback
+        # UTF-8-SIG accepts ordinary UTF-8 and strips a leading UTF-8 BOM.
+        # Keep the existing Latin-1 fallback for non-UTF-8 text files.
         try:
-            text = file_bytes.decode("utf-8")
+            text = file_bytes.decode("utf-8-sig")
         except UnicodeDecodeError:
             text = file_bytes.decode("latin-1", errors="replace")
 

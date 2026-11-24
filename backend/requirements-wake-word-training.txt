@@ -1,0 +1,2 @@
+# Isolated training environment only; no GUI, TTS, or automatic ACAV dataset downloads.
+wakeword-trainer==0.1.2

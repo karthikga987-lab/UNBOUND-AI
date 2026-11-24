@@ -7,9 +7,10 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
 from backend.app.llm.provider import LLMConfigurationError, LLMProviderError
+from backend.app.assistant.intent import AssistantIntentCategory, classify_assistant_intent
 from backend.app.orchestrator.planner import PlanError, generate_plan
 from backend.app.orchestrator.task_manager import InvalidApprovalError
-from backend.app.schemas.contracts import ApprovalStatus, ExecutionEvent, TaskCreateRequest, TaskResponse
+from backend.app.schemas.contracts import ApprovalStatus, EventStatus, ExecutionEvent, TaskCreateRequest, TaskResponse
 
 router = APIRouter(prefix="/tasks")
 
@@ -31,15 +32,70 @@ def create_task(body: TaskCreateRequest, request: Request) -> TaskResponse:
     runtime = request.app.state.runtime
     try:
         provider = runtime.get_provider()
+        classification = classify_assistant_intent(
+            body.user_request,
+            provider,
+            registered_tools=[
+                {
+                    "tool_name": tool.tool_name,
+                    "description": tool.description,
+                    "requires_approval": tool.requires_approval,
+                }
+                for tool in runtime.registry.list_tools()
+            ],
+        )
+        if classification.category in {
+            AssistantIntentCategory.CONVERSATION,
+            AssistantIntentCategory.INFORMATION,
+            AssistantIntentCategory.DRAFTING,
+        }:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "not_a_task_request",
+                    "message": "This is a conversation or information request. Send it to POST /api/assistant/requests or the session conversation endpoint; no task was created.",
+                },
+            )
+        if classification.category == AssistantIntentCategory.CLARIFICATION_REQUIRED:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "task_clarification_required",
+                    "message": classification.clarification_question or "Please clarify the action before requesting a task plan.",
+                },
+            )
+
+        # Classification only gates conversation from the task API. Actionable
+        # requests still pass through the existing structured planner, registry
+        # validation, approvals, and independent verification.
         plan = generate_plan(body, runtime.registry, provider)
         task = runtime.manager.create(body, plan.steps, plan.missing_information)
+        if plan.intent_missing_information:
+            runtime.manager.event(
+                task,
+                "planning.intent_needs_information",
+                EventStatus.NEEDS_ATTENTION,
+                f"Intent extraction requested {len(plan.intent_missing_information)} clarification item(s).",
+            )
+        if plan.plan_missing_information:
+            runtime.manager.event(
+                task,
+                "planning.plan_needs_information",
+                EventStatus.NEEDS_ATTENTION,
+                f"Plan generation requested {len(plan.plan_missing_information)} clarification item(s).",
+            )
         if body.auto_execute:
-            return runtime.executor.run(task.task_id)
+            executed = runtime.executor.run(task.task_id)
+            if executed.status.value == "completed":
+                return runtime.summarize_verified_browser_task(task.task_id)
+            return executed
         return task
+    except HTTPException:
+        raise
     except LLMConfigurationError as exc:
         raise HTTPException(status_code=503, detail={"code": "llm_unavailable", "message": "LLM provider is not configured"}) from exc
     except LLMProviderError as exc:
-        raise HTTPException(status_code=503, detail={"code": "llm_provider_error", "message": "LLM provider request failed"}) from exc
+        raise HTTPException(status_code=503, detail={"code": "llm_provider_error", "message": exc.public_message}) from exc
     except PlanError as exc:
         raise HTTPException(status_code=422, detail={"code": "invalid_plan", "message": "The request could not be planned safely"}) from exc
     except ValueError as exc:
@@ -56,7 +112,10 @@ def execute_task(task_id: UUID, request: Request) -> TaskResponse:
     runtime = request.app.state.runtime
     _task_or_404(runtime, task_id)
     try:
-        return runtime.executor.run(task_id)
+        executed = runtime.executor.run(task_id)
+        if executed.status.value == "completed":
+            return runtime.summarize_verified_browser_task(task_id)
+        return executed
     except (ValueError, KeyError) as exc:
         raise HTTPException(status_code=400, detail={"code": "invalid_operation", "message": str(exc)}) from exc
 

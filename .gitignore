@@ -8,6 +8,16 @@ __pycache__/
 .venv-wake-train/
 venv/
 
+# Local runtime databases and browser binaries
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+.playwright-browsers/
+playwright-report/
+test-results/
+
 # Environment secrets
 .env
 .env.*

@@ -1,0 +1,2 @@
+# Optional, isolated S3 storage support. Install only when S3 features are used.
+boto3>=1.34,<2

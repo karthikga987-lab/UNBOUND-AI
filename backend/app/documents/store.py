@@ -159,17 +159,45 @@ class DocumentStore:
         except ValueError as exc:
             raise PermissionError(f"Path traversal detected: {dest}") from exc
 
-        dest.write_bytes(file_bytes)
+        created = False
+        try:
+            # A caller-supplied/reused ID must never truncate an existing source.
+            with dest.open("xb") as stored_file:
+                created = True
+                stored_file.write(file_bytes)
+        except Exception:
+            # Remove only a file this invocation created; never clean up a
+            # collision belonging to an already stored document.
+            if created:
+                try:
+                    dest.unlink(missing_ok=True)
+                except OSError as cleanup_exc:
+                    logger.warning("Partial document cleanup failed: exception_class=%s", type(cleanup_exc).__name__)
+            raise
         return document_id, stored_filename, str(dest)
 
     def cleanup_failed_ingestion(self, document_id: str, stored_filename: str) -> None:
         """Remove only files created for a failed, uncommitted ingestion."""
+        try:
+            existing_record = self.get_record(document_id)
+        except Exception as exc:
+            # If the DB state cannot be checked, preserve files rather than
+            # risk deleting a source that may already be committed.
+            logger.warning("Could not confirm document cleanup ownership: exception_class=%s", type(exc).__name__)
+            return
+        protected_paths = set()
+        if existing_record is not None:
+            protected_paths.add(Path(existing_record.file_path).resolve())
+            if existing_record.text_file_path:
+                protected_paths.add(Path(existing_record.text_file_path).resolve())
         for base, name in ((self.files_dir, stored_filename), (self.texts_dir, f"{document_id}.txt")):
             candidate = (base / name).resolve()
             try:
                 candidate.relative_to(base.resolve())
             except ValueError:
                 logger.error("Refusing document cleanup outside storage boundary")
+                continue
+            if candidate in protected_paths:
                 continue
             try:
                 candidate.unlink(missing_ok=True)
@@ -181,6 +209,8 @@ class DocumentStore:
         file_path: str, result: ExtractionResult,
     ) -> DocumentRecord:
         """Persist extraction results: writes text file and stores DB record."""
+        if self.get_record(document_id) is not None:
+            raise ValueError("Document ID is already stored")
         text_file_path: str | None = None
         record = DocumentRecord(
             document_id=document_id,

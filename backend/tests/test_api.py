@@ -5,11 +5,12 @@ from threading import Event
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 import pytest
 
 from backend.app.api.runtime import TaskRuntime
-from backend.app.llm.provider import LLMConfigurationError
+from backend.app.assistant.intent import AssistantIntent, AssistantIntentCategory
+from backend.app.llm.provider import LLMConfigurationError, LLMProviderError, LLMResponseFormatError
 from backend.app.main import create_app
 from backend.app.orchestrator.intent import TaskIntent
 from backend.app.orchestrator.planner import PlanDraft
@@ -28,9 +29,16 @@ class FakeProvider:
     def __init__(self, results):
         self.results = iter(results)
 
-    def generate_json(self, *, system, prompt, response_model):
+    def generate_json(self, *, system, prompt, response_model, **kwargs):
         value = next(self.results)
         return response_model.model_validate(value.model_dump())
+
+
+def task_execution_intent():
+    return AssistantIntent(
+        category=AssistantIntentCategory.ACTION_EXECUTION,
+        current_turn_authorizes_execution=True,
+    )
 
 
 class SearchInput(BaseModel):
@@ -62,7 +70,7 @@ def planned_runtime(*, verifier=lambda tool, expected, result: True, verified=Tr
         input={"query": "quarterly report"},
         expected_outcome="The quarterly report is found",
     )])
-    runtime = TaskRuntime(provider=FakeProvider([intent, draft]), verifier=verifier)
+    runtime = TaskRuntime(provider=FakeProvider([task_execution_intent(), intent, draft]), verifier=verifier)
     calls = []
     register_search(runtime, calls, verified=verified)
     return runtime, calls
@@ -77,8 +85,10 @@ def test_application_starts_without_llm_credentials_and_health_is_honest(monkeyp
     assert response.json() == {
         "status": "ok",
         "llm_configured": False,
-        "tools_registered": False,
-        "registered_tools_count": 0,
+        "tools_registered": True,
+        "registered_tools_count": 4,
+        "notification_agent_installed": False,
+        "notification_agent_running": False,
     }
 
 
@@ -93,6 +103,234 @@ def test_task_creation_retrieval_and_shared_runtime_state():
     assert retrieved.json()["task_id"] == task_id
     assert len(retrieved.json()["plan"]) == 1
     assert client.get("/api/health").json()["registered_tools_count"] == 1
+
+
+def test_conversational_question_is_rejected_by_task_endpoint_without_creating_task():
+    runtime = TaskRuntime(provider=FakeProvider([
+        AssistantIntent(category=AssistantIntentCategory.INFORMATION),
+    ]))
+    client = TestClient(create_app(runtime))
+
+    response = client.post(
+        "/api/tasks",
+        json={"user_request": "Hello, UNBOUND. Are you connected to my local model?"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "not_a_task_request"
+    assert "POST /api/assistant/requests" in response.json()["detail"]["message"]
+    assert runtime.manager.repository._tasks == {}
+
+
+def test_actionable_request_is_classified_then_planned_by_existing_workflow():
+    runtime, _ = planned_runtime()
+    response = TestClient(create_app(runtime)).post(
+        "/api/tasks", json={"user_request": "Find the quarterly report"}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "created"
+    assert [step["tool_name"] for step in response.json()["plan"]] == ["document.search"]
+
+
+def test_manual_task_creation_does_not_execute_until_explicit_execute_request():
+    runtime, calls = planned_runtime()
+    client = TestClient(create_app(runtime))
+
+    created = client.post(
+        "/api/tasks", json={"user_request": "Find the quarterly report", "auto_execute": False}
+    )
+
+    assert created.status_code == 200
+    assert created.json()["status"] == "created"
+    assert calls == []
+    executed = client.post(f"/api/tasks/{created.json()['task_id']}/execute")
+    assert executed.status_code == 200
+    assert executed.json()["status"] == "completed"
+    assert len(calls) == 1
+
+
+def test_auto_execute_runs_only_after_a_valid_plan_is_created():
+    runtime, calls = planned_runtime()
+    response = TestClient(create_app(runtime)).post(
+        "/api/tasks", json={"user_request": "Find the quarterly report", "auto_execute": True}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "completed"
+    assert len(response.json()["plan"]) == 1
+    assert len(calls) == 1
+
+
+def test_provider_connection_failure_is_explicit_and_creates_no_task():
+    class FailingProvider:
+        def generate_json(self, **kwargs):
+            raise LLMProviderError(
+                "transport failed internally",
+                public_message="Cannot connect to the language model service. Check that Ollama is running.",
+            )
+
+    runtime = TaskRuntime(provider=FailingProvider())
+    response = TestClient(create_app(runtime)).post(
+        "/api/tasks", json={"user_request": "Find the quarterly report"}
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "llm_provider_error"
+    assert "Ollama is running" in response.json()["detail"]["message"]
+    assert "transport failed internally" not in response.text
+    assert runtime.manager.repository._tasks == {}
+
+
+def test_provider_connection_failure_during_plan_generation_is_explicit():
+    class FailingPlanProvider:
+        def generate_json(self, *, response_model, **kwargs):
+            if response_model is AssistantIntent:
+                return task_execution_intent()
+            if response_model is TaskIntent:
+                return TaskIntent(goal="Find the quarterly report")
+            raise LLMProviderError(
+                "connection reset while generating plan",
+                public_message="Cannot connect to the language model service. Check that Ollama is running.",
+            )
+
+    runtime = TaskRuntime(provider=FailingPlanProvider())
+    register_search(runtime, [])
+    response = TestClient(create_app(runtime)).post(
+        "/api/tasks", json={"user_request": "Find the quarterly report"}
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "llm_provider_error"
+    assert "Ollama is running" in response.json()["detail"]["message"]
+    assert runtime.manager.repository._tasks == {}
+
+
+@pytest.mark.parametrize(
+    "draft_payload",
+    [
+        {"missing_information": ["Which report?"]},  # required top-level steps is absent
+        {"steps": [{"step_id": "s1", "tool_name": "document.search"}], "missing_information": []},  # incomplete TaskStep
+        {"steps": [], "missing_information": [{"field": "report period"}]},  # entries must be strings
+    ],
+)
+def test_malformed_planner_response_is_explicit_not_an_empty_clarification_task(draft_payload):
+    class MalformedPlannerProvider:
+        def generate_json(self, *, response_model, **kwargs):
+            if response_model is AssistantIntent:
+                return task_execution_intent()
+            if response_model is TaskIntent:
+                return TaskIntent(goal="Find the quarterly report")
+            if response_model is PlanDraft:
+                # Simulate strict provider-side Pydantic validation. Invalid
+                # output must never become an executable or empty clarification task.
+                return response_model.model_validate(draft_payload)
+            raise AssertionError(f"Unexpected structured response model: {response_model!r}")
+
+    runtime = TaskRuntime(provider=MalformedPlannerProvider())
+    calls = []
+    register_search(runtime, calls)
+    response = TestClient(create_app(runtime)).post(
+        "/api/tasks", json={"user_request": "Find the quarterly report", "auto_execute": True}
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "invalid_plan"
+    assert runtime.manager.repository._tasks == {}
+    assert calls == []
+
+
+def test_assistant_request_maps_invalid_structured_plan_to_safe_error_without_creating_task():
+    class InvalidPlanProvider:
+        def generate_json(self, *, response_model, **kwargs):
+            if response_model is AssistantIntent:
+                return AssistantIntent(category=AssistantIntentCategory.ACTION_PLANNING)
+            if response_model is TaskIntent:
+                return TaskIntent(goal="Search the synthetic report")
+            if response_model is PlanDraft:
+                raise LLMResponseFormatError("private schema detail")
+            raise AssertionError(f"Unexpected structured response model: {response_model!r}")
+
+    runtime = TaskRuntime(provider=InvalidPlanProvider())
+    calls = []
+    register_search(runtime, calls)
+    response = TestClient(create_app(runtime)).post(
+        "/api/assistant/requests", json={"message": "Search the synthetic report"}
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "invalid_plan"
+    assert "private schema detail" not in response.text
+    assert runtime.manager.repository._tasks == {}
+    assert calls == []
+
+
+def test_assistant_request_valid_plan_is_prepared_without_execution():
+    provider = FakeProvider([
+        AssistantIntent(category=AssistantIntentCategory.ACTION_PLANNING),
+        TaskIntent(goal="Search a synthetic report"),
+        PlanDraft(steps=[TaskStep(
+            step_id="step_1", tool_name="document.search", description="Search synthetic reports",
+            input={"query": "synthetic quarterly report"}, expected_outcome="A matching report is found",
+        )], missing_information=[]),
+    ])
+    runtime = TaskRuntime(provider=provider)
+    calls = []
+    register_search(runtime, calls)
+
+    response = TestClient(create_app(runtime)).post(
+        "/api/assistant/requests", json={"message": "Search synthetic quarterly reports"}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["task"]["status"] == "created"
+    assert response.json()["task"]["plan"][0]["tool_name"] == "document.search"
+    assert calls == []
+
+
+def test_assistant_request_missing_plan_information_asks_clarification_without_task():
+    provider = FakeProvider([
+        AssistantIntent(category=AssistantIntentCategory.ACTION_PLANNING),
+        TaskIntent(goal="Search the report"),
+        PlanDraft(steps=[], missing_information=["Which report period should I search?"]),
+    ])
+    runtime = TaskRuntime(provider=provider)
+    calls = []
+    register_search(runtime, calls)
+
+    response = TestClient(create_app(runtime)).post(
+        "/api/assistant/requests", json={"message": "Search for the report"}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["task"] is None
+    assert response.json()["intent"]["category"] == "clarification_required"
+    assert "Which report period should I search?" in response.json()["reply"]
+    assert runtime.manager.repository._tasks == {}
+    assert calls == []
+
+
+def test_task_plan_records_intent_and_plan_clarification_diagnostics_separately():
+    runtime = TaskRuntime(provider=FakeProvider([
+        AssistantIntent(category=AssistantIntentCategory.ACTION_PLANNING),
+        TaskIntent(goal="Find a report", missing_information=["report period"]),
+        PlanDraft(steps=[], missing_information=["target document collection"]),
+    ]))
+    register_search(runtime, [])
+    client = TestClient(create_app(runtime))
+
+    created = client.post("/api/tasks", json={"user_request": "Plan a report search"})
+
+    assert created.status_code == 200
+    assert created.json()["status"] == "needs_attention"
+    events = client.get(f"/api/tasks/{created.json()['task_id']}/events").json()
+    by_type = {event["event_type"]: event["message"] for event in events}
+    assert by_type["planning.intent_needs_information"] == (
+        "Intent extraction requested 1 clarification item(s)."
+    )
+    assert by_type["planning.plan_needs_information"] == (
+        "Plan generation requested 1 clarification item(s)."
+    )
 
 
 def test_runtime_allows_late_tool_and_verifier_registration():
@@ -132,7 +370,7 @@ def test_runtime_tool_specific_failed_verifier_prevents_completion():
     client = TestClient(create_app(runtime))
     task_id = client.post("/api/tasks", json={"user_request": "Find the quarterly report"}).json()["task_id"]
     result = client.post(f"/api/tasks/{task_id}/execute").json()
-    assert result["status"] == "failed"
+    assert result["status"] == "needs_attention"
     assert result["plan"][0]["status"] == "failed"
     assert len(calls) == 1
 
@@ -201,7 +439,7 @@ def test_concurrent_verifier_update_waits_until_active_run_finishes():
 
     second_result = runtime.executor.run(new_task().task_id)
     assert first_result.status.value == "completed"
-    assert second_result.status.value == "failed"
+    assert second_result.status.value == "needs_attention"
     assert len(calls) == 2
 
 
@@ -247,6 +485,7 @@ def test_approval_resolution_requires_explicit_decision_and_does_not_auto_execut
 
     calls = []
     runtime = TaskRuntime(provider=FakeProvider([
+        task_execution_intent(),
         TaskIntent(goal="Send the message"),
         PlanDraft(steps=[TaskStep(
             step_id="send_message", tool_name="browser.click", description="Send the message",
@@ -265,8 +504,9 @@ def test_approval_resolution_requires_explicit_decision_and_does_not_auto_execut
     approval_id = pending["pending_approvals"][0]["approval_id"]
     approved = client.post(f"/api/tasks/{task_id}/approvals/{approval_id}", json={"decision": "APPROVED"})
     assert approved.status_code == 200
-    assert approved.json()["status"] == "executing"
+    assert approved.json()["status"] == "created"
     assert calls == []
+    assert approved.json()["plan"][0]["status"] == "pending"
     already_resolved = client.post(f"/api/tasks/{task_id}/approvals/{approval_id}", json={"decision": "APPROVED"})
     assert already_resolved.status_code == 404
     assert client.post(f"/api/tasks/{task_id}/execute").json()["status"] == "completed"
@@ -290,6 +530,7 @@ def test_rejected_approval_is_audited_and_never_executes():
 
     calls = []
     runtime = TaskRuntime(provider=FakeProvider([
+        task_execution_intent(),
         TaskIntent(goal="Send a message"),
         PlanDraft(steps=[TaskStep(
             step_id="send_message", tool_name="browser.click", description="Send a message",
@@ -335,17 +576,20 @@ def test_auto_execute_cannot_bypass_missing_verifier_or_tool_verification():
     client = TestClient(create_app(runtime))
     created = client.post("/api/tasks", json={"user_request": "Find the quarterly report", "auto_execute": True})
     assert created.status_code == 200
-    assert created.json()["status"] == "failed"
+    assert created.json()["status"] == "needs_attention"
     assert created.json()["plan"][0]["status"] == "failed"
     assert len(calls) == 1
 
 
 def test_missing_information_is_returned_without_execution():
     runtime = TaskRuntime(provider=FakeProvider([
+        task_execution_intent(),
         TaskIntent(goal="Find a report", missing_information=["Which year?"]),
         PlanDraft(steps=[], missing_information=[]),
     ]))
-    response = TestClient(create_app(runtime)).post("/api/tasks", json={"user_request": "Find a report"})
+    response = TestClient(create_app(runtime)).post(
+        "/api/tasks", json={"user_request": "Find a report", "auto_execute": True}
+    )
     assert response.status_code == 200
     assert response.json()["status"] == "needs_attention"
     assert response.json()["result"]["missing_information"] == [
@@ -354,7 +598,7 @@ def test_missing_information_is_returned_without_execution():
 
 
 def test_unavailable_tools_never_produce_false_success():
-    runtime = TaskRuntime(provider=FakeProvider([TaskIntent(goal="Open a website")]))
+    runtime = TaskRuntime(provider=FakeProvider([task_execution_intent(), TaskIntent(goal="Open a website")]))
     client = TestClient(create_app(runtime))
     created = client.post("/api/tasks", json={"user_request": "Open a website"})
     assert created.status_code == 200

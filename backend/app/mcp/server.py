@@ -73,6 +73,16 @@ class DocumentMCPServer:
     # Tool implementations (pure Python, testable without MCP runtime)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _evidence_for_mcp(evidence) -> list[dict[str, Any]]:
+        """Keep source provenance while omitting private local storage paths."""
+        items = []
+        for item in evidence:
+            value = item.model_dump(mode="json")
+            value.pop("file_path", None)
+            items.append(value)
+        return items
+
     def tool_document_upload(
         self, relative_path: str, original_filename: str, *, user_approved: bool = False
     ) -> dict[str, Any]:
@@ -183,7 +193,7 @@ class DocumentMCPServer:
         return {
             "success": result.success,
             "data": result.data,
-            "evidence": [ev.model_dump(mode="json") for ev in result.evidence],
+            "evidence": self._evidence_for_mcp(result.evidence),
             "error": result.error,
         }
 
@@ -202,7 +212,7 @@ class DocumentMCPServer:
         return {
             "success": result.success,
             "data": result.data,
-            "evidence": [ev.model_dump(mode="json") for ev in result.evidence],
+            "evidence": self._evidence_for_mcp(result.evidence),
             "error": result.error,
         }
 
@@ -213,16 +223,27 @@ class DocumentMCPServer:
             if record is None:
                 return {"success": False, "error": f"Document '{document_id}' not found"}
             chunks = self._store.get_chunks(document_id)
+            document = record.model_dump(mode="json")
+            # A local MCP consumer needs document identity/provenance, not the
+            # service's private absolute storage locations.
+            document.pop("file_path", None)
+            document.pop("text_file_path", None)
             return {
                 "success": True,
-                "document": record.model_dump(mode="json"),
+                "document": document,
                 "chunk_count": len(chunks),
             }
         records = self._store.list_records()
+        documents = []
+        for record in records:
+            document = record.model_dump(mode="json")
+            document.pop("file_path", None)
+            document.pop("text_file_path", None)
+            documents.append(document)
         return {
             "success": True,
-            "documents": [r.model_dump(mode="json") for r in records],
-            "total": len(records),
+            "documents": documents,
+            "total": len(documents),
         }
 
     # ------------------------------------------------------------------

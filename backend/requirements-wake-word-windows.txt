@@ -1,0 +1,3 @@
+# Optional local wake detector runtime; isolated from the main Python environment.
+pvporcupine==4.0.3
+pvrecorder==1.2.7

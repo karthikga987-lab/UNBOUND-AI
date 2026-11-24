@@ -10,7 +10,7 @@ from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
-from pydantic import AfterValidator, AwareDatetime, BaseModel, ConfigDict, Field, HttpUrl, StrictBool, StringConstraints, UUID4
+from pydantic import AfterValidator, AwareDatetime, BaseModel, ConfigDict, Field, HttpUrl, StrictBool, StringConstraints, UUID4, model_validator
 from typing_extensions import Annotated
 
 
@@ -101,11 +101,20 @@ class TaskStep(ContractModel):
     tool_name: NonEmptyString
     description: NonEmptyString
     input: dict[str, Any] = Field(default_factory=dict)
+    depends_on: list[NonEmptyString] = Field(default_factory=list)
     status: StepStatus = StepStatus.PENDING
     requires_approval: StrictBool = False
     expected_outcome: NonEmptyString
     verification: dict[str, Any] | None = None
     error: str | None = None
+
+    @model_validator(mode="after")
+    def validate_dependencies(self) -> "TaskStep":
+        if len(self.depends_on) != len(set(self.depends_on)):
+            raise ValueError("Task step dependencies must be unique")
+        if self.step_id in self.depends_on:
+            raise ValueError("A task step cannot depend on itself")
+        return self
 
 
 class ApprovalRequest(ContractModel):

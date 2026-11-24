@@ -320,6 +320,29 @@ class TestDocumentPersistence:
         # The stored file must be inside files_dir
         assert str(dest).startswith(str(tmp_store.files_dir))
 
+    def test_reused_document_id_cannot_overwrite_existing_file(self, tmp_store):
+        document_id = "stable-document-id"
+        original = b"original synthetic source"
+        _, stored_name, stored_path = tmp_store.save_file(
+            original, "source.txt", document_id=document_id
+        )
+        result = extract_document(original, document_id, "source.txt")
+        tmp_store.save_extraction(document_id, "source.txt", stored_name, stored_path, result)
+        original_text_path = Path(tmp_store.get_record(document_id).text_file_path)
+
+        with pytest.raises(FileExistsError):
+            tmp_store.save_file(b"replacement data", "source.txt", document_id=document_id)
+        with pytest.raises(ValueError, match="already stored"):
+            tmp_store.save_extraction(
+                document_id, "source.txt", stored_name, stored_path,
+                extract_document(b"replacement data", document_id, "source.txt"),
+            )
+        tmp_store.cleanup_failed_ingestion(document_id, stored_name)
+
+        assert Path(stored_path).read_bytes() == original
+        assert original_text_path.read_text(encoding="utf-8") == original.decode()
+        assert tmp_store.get_record(document_id) is not None
+
 
 # ---------------------------------------------------------------------------
 # 7. Chunk retrieval
@@ -354,6 +377,32 @@ class TestChunkRetrieval:
 
 
 class TestDocumentSearch:
+    def test_docx_section_heading_is_searchable_without_mutating_chunk_text(self, tmp_store, searcher):
+        from docx import Document
+        doc = Document()
+        doc.add_heading("Risks", level=1)
+        doc.add_paragraph("Equipment delivery delays and installation overruns are listed.")
+        doc.add_heading("Background", level=1)
+        doc.add_paragraph("The general report notes that risks should be reviewed annually.")
+        buffer = io.BytesIO()
+        doc.save(buffer)
+        extraction = extract_document(buffer.getvalue(), "docx-heading-search", "risks.docx")
+        assert extraction.status == ExtractionStatus.SUCCESS
+        risk_chunk = next(chunk for chunk in extraction.chunks if chunk.section == "Risks")
+        unrelated_chunk = next(chunk for chunk in extraction.chunks if chunk.section == "Background")
+
+        _, filename, filepath = tmp_store.save_file(buffer.getvalue(), "risks.docx", document_id="docx-heading-search")
+        tmp_store.save_extraction("docx-heading-search", "risks.docx", filename, filepath, extraction)
+
+        results = searcher.search("risks", top_k=5, document_ids=["docx-heading-search"])
+        assert results
+        assert results[0].chunk.section == "Risks"
+        assert results[0].chunk.chunk_id == risk_chunk.chunk_id
+        assert results[0].chunk.text == "Equipment delivery delays and installation overruns are listed."
+        assert "Risks" not in results[0].chunk.text
+        assert results[0].chunk.section == "Risks"  # heading metadata is retained for provenance
+        assert next(item for item in results if item.chunk.chunk_id == unrelated_chunk.chunk_id).score < results[0].score
+
     def test_search_returns_results(self, tmp_store, searcher, sample_txt_bytes):
         doc_id, stored, path = tmp_store.save_file(sample_txt_bytes, "report.txt")
         result = extract_document(sample_txt_bytes, doc_id, "report.txt")
@@ -629,6 +678,20 @@ class TestMCPToolInvocations:
         assert result["success"] is True
         assert result["document"]["document_id"] == doc_id
 
+    def test_mcp_provenance_omits_private_local_storage_paths(self, mcp_server, sample_txt_path):
+        upload = mcp_server.tool_document_upload(
+            sample_txt_path.name, "report.txt", user_approved=True
+        )
+        document_id = upload["document_id"]
+        manifest = mcp_server.tool_evidence_list(document_id=document_id)
+        context = mcp_server.tool_context_retrieve(query="revenue billion")
+
+        assert "file_path" not in manifest["document"]
+        assert "text_file_path" not in manifest["document"]
+        assert context["evidence"]
+        assert all("file_path" not in item for item in context["evidence"])
+        assert all(item["source_name"] == "report.txt" for item in context["evidence"])
+
     def test_mcp_evidence_list_unknown(self, mcp_server):
         result = mcp_server.tool_evidence_list(document_id="nonexistent-id")
         assert result["success"] is False
@@ -778,6 +841,30 @@ class TestFastAPIEndpoints:
         files = {"file": ("bad.pdf", b"NOT A VALID PDF FILE STREAM", "application/pdf")}
         resp = client.post("/api/documents/upload", files=files)
         assert resp.status_code == 422
+
+    def test_failed_persistence_cleans_uploaded_file(self, tmp_path, monkeypatch):
+        from fastapi.testclient import TestClient
+        from backend.app.api.runtime import TaskRuntime
+        from backend.app.documents.store import DocumentStore
+        from backend.app.main import create_app
+
+        store = DocumentStore(storage_dir=tmp_path / "failed_storage")
+        runtime = TaskRuntime(document_store=store)
+        runtime.register_document_tools()
+
+        def fail_persistence(*args, **kwargs):
+            raise OSError("synthetic persistence failure")
+
+        monkeypatch.setattr(store, "save_extraction", fail_persistence)
+        response = TestClient(create_app(runtime=runtime)).post(
+            "/api/documents/upload",
+            files={"file": ("synthetic.txt", b"synthetic content", "text/plain")},
+        )
+
+        assert response.status_code == 503
+        assert store.list_records() == []
+        assert list(store.files_dir.iterdir()) == []
+        assert list(store.texts_dir.iterdir()) == []
 
     def test_list_documents(self, client):
         files = {"file": ("doc_a.txt", b"Content of Doc A", "text/plain")}

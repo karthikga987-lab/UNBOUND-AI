@@ -105,9 +105,12 @@ class DocumentSearcher:
         num_chunks = len(all_chunks)
         doc_freq: dict[str, int] = {}
         tokenized: list[list[str]] = []
+        section_tokenized: list[list[str]] = []
         for chunk in all_chunks:
             tokens = _tokenize(chunk.text)
             tokenized.append(tokens)
+            section_tokens = _tokenize(chunk.section or "")
+            section_tokenized.append(section_tokens)
             for term in set(tokens):
                 doc_freq[term] = doc_freq.get(term, 0) + 1
 
@@ -118,8 +121,18 @@ class DocumentSearcher:
 
         # Score each chunk
         scored: list[tuple[float, list[str], DocumentChunk]] = []
-        for chunk, tokens in zip(all_chunks, tokenized):
+        total_query_weight = sum(idf.get(term, 1.0) for term in query_terms)
+        for chunk, tokens, section_tokens in zip(all_chunks, tokenized, section_tokenized):
             score, matched = _score_chunk(tokens, query_terms, idf)
+            section_matches = [term for term in query_terms if term in section_tokens]
+            if section_matches:
+                # Headings are retrieval metadata, not source text. A heading
+                # match gets a ranking boost so heading-only queries find the
+                # right section even when its body lacks the heading word.
+                # Evidence validation must still quote chunk.text exactly.
+                section_weight = sum(idf.get(term, 1.0) for term in section_matches)
+                score += total_query_weight + section_weight
+                matched = list(dict.fromkeys([*matched, *section_matches]))
             if score > 0:
                 scored.append((score, matched, chunk))
 

@@ -50,6 +50,7 @@ def test_task_step_required_fields_defaults_and_nested_task_response():
     task_id = uuid4()
     step = TaskStep(step_id="step_1", tool_name="browser.navigate", description="Open report", expected_outcome="Report page visible")
     assert step.input == {}
+    assert step.depends_on == []
     assert step.requires_approval is False
     task = TaskResponse(user_request="Open report", task_id=task_id, plan=[step])
     assert task.plan[0].step_id == "step_1"
@@ -58,6 +59,22 @@ def test_task_step_required_fields_defaults_and_nested_task_response():
     assert task.created_at.tzinfo == timezone.utc
     with pytest.raises(ValidationError):
         TaskStep(tool_name="x", description="x", expected_outcome="x")
+
+
+def test_task_step_dependencies_round_trip_and_reject_duplicates_or_self_reference():
+    step = TaskStep(
+        step_id="step_2",
+        tool_name="report.generate",
+        description="Generate report",
+        expected_outcome="Report generated",
+        depends_on=["step_1"],
+    )
+    restored = TaskStep.model_validate_json(step.model_dump_json())
+    assert restored.depends_on == ["step_1"]
+    with pytest.raises(ValidationError):
+        TaskStep(step_id="step_2", tool_name="report.generate", description="Generate", expected_outcome="Ready", depends_on=["step_1", "step_1"])
+    with pytest.raises(ValidationError):
+        TaskStep(step_id="step_2", tool_name="report.generate", description="Generate", expected_outcome="Ready", depends_on=["step_2"])
 
 
 def test_identifiers_are_uuid4_and_datetimes_are_normalized_to_utc():
