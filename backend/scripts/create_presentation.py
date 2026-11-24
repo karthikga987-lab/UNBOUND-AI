@@ -146,7 +146,7 @@ def setup_slide_1(slide):
         elif s.shape_id == 41:
             s.text_frame.clear()
             usns = [
-                "USN: 1MS25CS077",
+                "USN: 1MS25CS076",
                 "USN: 1MS25CS108",
                 "USN: 1MS25CS114",
                 "USN: 1MS25CS072",
