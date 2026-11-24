@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import pytest
 
 from backend.app.browser.controller import BrowserController, BrowserControllerError
@@ -13,6 +14,20 @@ def test_controller_refuses_to_start_without_managed_loopback_proxy(monkeypatch)
     for proxy in (None, "http://127.0.0.1.evil:8888", "http://10.0.0.1:8000", "https://127.0.0.1:8000"):
         with pytest.raises(BrowserControllerError, match="managed loopback egress proxy"):
             BrowserController(proxy_server=proxy).start()
+
+
+def test_playwright_uses_installed_project_browser_cache_when_localappdata_is_isolated(monkeypatch):
+    from pathlib import Path
+    from backend.app.browser import controller
+
+    cache = Path(controller.__file__).resolve().parents[3] / ".playwright-browsers"
+    if not cache.is_dir():
+        pytest.skip("Project-local Playwright browser cache is not installed")
+    monkeypatch.delenv("PLAYWRIGHT_BROWSERS_PATH", raising=False)
+
+    controller._load_playwright()
+
+    assert Path(os.environ["PLAYWRIGHT_BROWSERS_PATH"]) == cache
 
 
 def test_controller_configures_proxy_and_context_request_guard(monkeypatch):

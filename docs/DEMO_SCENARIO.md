@@ -2,7 +2,7 @@
 
 > Public browser research remains disabled because real Chromium egress containment is unverified. An opt-in **LOCAL DEMO MODE** is available for a fixed synthetic page served by the local managed proxy; it uses real Chromium, the existing TaskManager/Executor, registered navigation/click tools, independent verification, and local Ollama summarization. The frontend shows task-backed observations and progress, but does not provide screenshot streaming or remote browser controls. Do not present the fixture as public-web access.
 
-> **Submission status (24 Nov 2026):** The local browser fixture flow passed through the real FastAPI assistant and execute APIs using Ollama and installed Chromium: a task was prepared, explicitly executed, two browser steps independently verified, two evidence items returned, and a local-model summary generated. The final real React/Edge interaction was not verified in this pass because computer control stopped when it could not confidently identify the browser URL. Public browser research and OS-level Chromium network containment remain unverified and disabled. Wake-word detection is unavailable without the custom model; workflow/document/integration panels marked by the UI are simulated; task/event/approval state is lost on backend restart. A synthetic due reminder was submitted through the Windows toast API and persisted as `submitted`; Windows did not report whether it was visibly displayed.
+> **Verification status (25 Nov 2026):** The real React UI was exercised in a browser at `http://127.0.0.1:5173` against the FastAPI backend on port 8001. A normal Ollama conversation completed; a synthetic TXT request preserved the exact `KARTHI~1` path, prepared without reading, requested approval, stayed unread after approval, then completed only after a separate Run plan action with verified quoted evidence and complete one-chunk coverage. The two-step LOCAL DEMO MODE browser workflow also ran through the UI with real Chromium: navigation and the exact “View details” click were independently verified and two evidence items were shown. The local `qwen3.5:4b` provider was directly exercised successfully. Public browser research and OS-level Chromium network containment remain unverified and disabled. Wake-word detection is unavailable without the custom model; workflow/document/integration panels marked by the UI are simulated; task/event/approval state is lost on backend restart. The Windows reminder scheduled task is running, but visible toast delivery was not retested in this pass.
 
 ## Flow
 
@@ -75,7 +75,7 @@ In a second PowerShell window, start React without changing `.env.local`:
 Set-Location "$env:USERPROFILE\UNBOUND-AI\frontend"
 $env:VITE_USE_MOCK = 'false'
 $env:VITE_BACKEND_PROXY_TARGET = 'http://127.0.0.1:8001'
-npm run dev -- --host 127.0.0.1 --port 5175 --strictPort
+npm run dev -- --host 127.0.0.1 --port 5173 --strictPort
 ```
 
 In Chat, submit: **“Open the Demo Product page at http://unbound-demo.invalid/product, click the View details link, and tell me its version and features.”** The assistant prepares a fixed two-step local plan and performs no browser action until the user selects **Run plan**. This read-only fixture does not require a consequential-action approval. Expect verified observations for version `2.1` and features `document search, task planning, evidence summaries`. Those values come from the synthetic fixture, not a real website. Stop both processes with `Ctrl+C` when finished.

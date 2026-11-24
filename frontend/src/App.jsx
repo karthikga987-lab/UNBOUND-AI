@@ -66,6 +66,54 @@ export default function App() {
 
   const handleSubmit = useCallback(async (text) => {
     if (!conversationId) throw new Error('Conversation is still being restored. Please try again.')
+    const approvalCommand = text.trim().toLowerCase()
+    if (approvalCommand === 'approve' || approvalCommand === 'reject') {
+      const latestMessage = messages.at(-1)
+      const linkedTaskId = activeTaskId && latestMessage?.role === 'assistant' && latestMessage.task_id === activeTaskId
+        ? activeTaskId
+        : null
+      const appendApprovalReply = (reply, task = null) => {
+        const messageKey = `${Date.now()}-${Math.random().toString(16).slice(2)}`
+        setMessages((prev) => [...prev,
+          { id: `${messageKey}-user`, role: 'user', content: text },
+          { id: `${messageKey}-assistant`, role: 'assistant', content: reply, task_id: task?.task_id, task_status: task?.status },
+        ])
+      }
+
+      // Typed approval is bound only to the task attached to the immediately
+      // preceding assistant task response. It records consent through the
+      // existing TaskManager endpoint and never executes the task.
+      if (!linkedTaskId) {
+        const reply = 'I could not match that response to a task just presented in this chat. Select the specific task and use its approval control; nothing was approved or executed.'
+        appendApprovalReply(reply)
+        return { reply, task: null }
+      }
+
+      const currentTask = await api.getTask(linkedTaskId)
+      setActiveTask(currentTask)
+      const pending = currentTask.pending_approvals ?? []
+      if (currentTask.status !== 'awaiting_approval' || pending.length !== 1) {
+        const reply = pending.length > 1
+          ? 'This task has multiple pending approvals. Use the approval control for the exact action you want to resolve.'
+          : 'This task has no pending approval yet. Use Run plan to request its approval; nothing was approved or executed.'
+        appendApprovalReply(reply, currentTask)
+        return { reply, task: currentTask }
+      }
+
+      const updatedTask = await api.decideApproval(
+        linkedTaskId,
+        pending[0].approval_id,
+        approvalCommand === 'approve' ? 'approved' : 'rejected',
+      )
+      setActiveTask(updatedTask)
+      setActiveTaskId(linkedTaskId)
+      const reply = approvalCommand === 'approve'
+        ? 'Approval was recorded for the exact pending action. Nothing was executed. Select Run plan separately to continue.'
+        : 'The exact pending action was rejected. It was not executed.'
+      appendApprovalReply(reply, updatedTask)
+      return { reply, task: updatedTask }
+    }
+
     const intent = await api.classifyAssistantRequest(text, conversationId)
     if (['conversation', 'information', 'drafting'].includes(intent.category)) {
       const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone
@@ -95,7 +143,7 @@ export default function App() {
     }
     setConversationError(null)
     return response
-  }, [conversationId])
+  }, [activeTaskId, conversationId, messages])
 
   const startNewConversation = useCallback(async () => {
     setConversationLoading(true)

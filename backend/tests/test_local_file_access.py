@@ -682,6 +682,7 @@ def test_assistant_route_prepares_approval_gated_file_task(tmp_path):
     completed = client.post(f"/api/tasks/{task_id}/execute").json()
     assert completed["status"] == "completed"
     assert completed["plan"][0]["verification"]["verified"] is True
+    assert completed["evidence"]
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Local absolute-path implementation is intentionally Windows-only")

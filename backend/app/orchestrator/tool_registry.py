@@ -168,6 +168,22 @@ class ToolRegistry:
                 # that the operation failed. Keep the state known-failed and
                 # discard adapter error text, which may contain private data.
                 error = "Registered tool reported unsuccessful execution"
+                if call.tool_name.startswith("browser.") and isinstance(validated.data, dict):
+                    browser_failures = {
+                        "local_demo_mode_not_enabled": (
+                            "Local Demo Mode is not enabled. Restart the backend with "
+                            "UNBOUND_BROWSER_LOCAL_DEMO=1 to use the fixed synthetic page."
+                        ),
+                        "browser_execution_disabled": "Browser execution is disabled by the runtime security gate.",
+                    }
+                    failure_code = validated.data.get("failure_code")
+                    if failure_code in browser_failures:
+                        logger.warning(
+                            "Registered browser tool was blocked by runtime policy: tool_name=%s failure_code=%s",
+                            call.tool_name,
+                            failure_code,
+                        )
+                        error = browser_failures[failure_code]
                 if call.tool_name == "document.read_local_file" and isinstance(validated.data, dict):
                     # Surface only a bounded internal category. Adapter error
                     # strings can contain paths or other private values.

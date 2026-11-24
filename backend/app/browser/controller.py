@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import ipaddress
+import os
+from pathlib import Path
 from typing import Any, Literal, Mapping
 from urllib.parse import urlsplit
 
@@ -39,6 +41,15 @@ class BrowserControllerError(RuntimeError):
 
 def _load_playwright():
     """Load Playwright lazily so importing backend modules needs no browser install."""
+    # Playwright normally looks under LOCALAPPDATA on Windows. UNBOUND's
+    # documented local install keeps browser binaries beside the checkout so
+    # tests (and isolated per-user app data) can still find the installed
+    # Chromium. Respect an explicit setting; only select the project cache
+    # when it exists and no path was configured.
+    if not os.getenv("PLAYWRIGHT_BROWSERS_PATH"):
+        project_cache = Path(__file__).resolve().parents[3] / ".playwright-browsers"
+        if project_cache.is_dir():
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(project_cache)
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as exc:

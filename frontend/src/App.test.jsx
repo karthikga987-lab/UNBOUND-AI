@@ -7,6 +7,8 @@ const state = vi.hoisted(() => ({
     createConversation: vi.fn(),
     getConversation: vi.fn(),
     getConversationTaskReferences: vi.fn(),
+    getTask: vi.fn(),
+    decideApproval: vi.fn(),
     classifyAssistantRequest: vi.fn(),
     sendConversationMessage: vi.fn(),
     assistantRequest: vi.fn(),
@@ -50,6 +52,8 @@ beforeEach(() => {
   state.api.createConversation.mockResolvedValue(session)
   state.api.getConversation.mockResolvedValue({ ...session, messages: [] })
   state.api.getConversationTaskReferences.mockResolvedValue({ session_id: session.session_id, available_task_ids: [], unavailable_task_ids: [] })
+  state.api.getTask.mockResolvedValue({ task_id: 'task-1', status: 'created', pending_approvals: [], plan: [] })
+  state.api.decideApproval.mockResolvedValue({ task_id: 'task-1', status: 'created', pending_approvals: [], plan: [] })
   state.api.classifyAssistantRequest.mockResolvedValue({ category: 'information' })
   state.api.sendConversationMessage.mockResolvedValue({
     session_id: session.session_id,
@@ -142,6 +146,106 @@ describe('React assistant chat routing', () => {
 
     expect((await screen.findByTestId('task-workspace')).textContent).toContain('completed-document-task')
     expect(state.api.getConversationTaskReferences).toHaveBeenCalledWith(session.session_id)
+  })
+
+  it('binds a typed approve response to the linked pending approval without executing the task', async () => {
+    window.localStorage.setItem('unbound.conversation_id', session.session_id)
+    state.api.getConversation.mockResolvedValueOnce({
+      ...session,
+      messages: [{ message_id: 'assistant-plan', role: 'assistant', content: 'File read task is ready for approval.', task_id: 'file-task' }],
+    })
+    state.api.getConversationTaskReferences.mockResolvedValueOnce({
+      session_id: session.session_id,
+      available_task_ids: ['file-task'],
+      unavailable_task_ids: [],
+    })
+    const approval = { approval_id: 'approval-file', tool_name: 'document.read_local_file', step_id: 'read' }
+    state.api.getTask.mockResolvedValueOnce({
+      task_id: 'file-task', status: 'awaiting_approval', pending_approvals: [approval], plan: [],
+    })
+    state.api.decideApproval.mockResolvedValueOnce({
+      task_id: 'file-task', status: 'created', pending_approvals: [], plan: [],
+    })
+    render(<App />)
+
+    const input = await screen.findByPlaceholderText(/ask a question/i)
+    fireEvent.change(input, { target: { value: 'approve' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    expect(await screen.findByText(/approval was recorded for the exact pending action/i)).toBeTruthy()
+    expect(state.api.getTask).toHaveBeenCalledWith('file-task')
+    expect(state.api.decideApproval).toHaveBeenCalledWith('file-task', 'approval-file', 'approved')
+    expect(state.api.classifyAssistantRequest).not.toHaveBeenCalled()
+    expect(state.api.assistantRequest).not.toHaveBeenCalled()
+    expect(state.api.executeTask).not.toHaveBeenCalled()
+  })
+
+  it('keeps a file approval bound when a browser task is submitted next', async () => {
+    window.localStorage.setItem('unbound.conversation_id', session.session_id)
+    state.api.getConversation.mockResolvedValueOnce({
+      ...session,
+      messages: [{ message_id: 'assistant-file-plan', role: 'assistant', content: 'File read task is ready for approval.', task_id: 'file-task' }],
+    })
+    state.api.getConversationTaskReferences.mockResolvedValueOnce({
+      session_id: session.session_id,
+      available_task_ids: ['file-task'],
+      unavailable_task_ids: [],
+    })
+    state.api.getTask.mockResolvedValueOnce({
+      task_id: 'file-task',
+      status: 'awaiting_approval',
+      pending_approvals: [{ approval_id: 'file-approval', tool_name: 'document.read_local_file' }],
+      plan: [],
+    })
+    state.api.decideApproval.mockResolvedValueOnce({
+      task_id: 'file-task', status: 'created', pending_approvals: [], plan: [],
+    })
+    state.api.classifyAssistantRequest.mockResolvedValueOnce({ category: 'action_execution' })
+    state.api.assistantRequest.mockResolvedValueOnce({
+      intent: { category: 'action_execution' },
+      reply: 'Browser task is prepared.',
+      task: { task_id: 'browser-task', status: 'created', pending_approvals: [], plan: [{ tool_name: 'browser.navigate', input: { url: 'http://unbound-demo.invalid/product' } }] },
+    })
+    render(<App />)
+
+    const input = await screen.findByPlaceholderText(/ask a question/i)
+    fireEvent.change(input, { target: { value: 'approve' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    expect(await screen.findByText(/approval was recorded for the exact pending action/i)).toBeTruthy()
+
+    fireEvent.change(input, { target: { value: 'Open http://unbound-demo.invalid/product and summarize it.' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    expect(await screen.findByText('Browser task is prepared.')).toBeTruthy()
+    expect(state.api.decideApproval).toHaveBeenCalledTimes(1)
+    expect(state.api.decideApproval).toHaveBeenCalledWith('file-task', 'file-approval', 'approved')
+    expect(state.api.assistantRequest).toHaveBeenCalledWith('Open http://unbound-demo.invalid/product and summarize it.', session.session_id)
+    expect(state.api.executeTask).not.toHaveBeenCalled()
+  })
+
+  it('does not treat approve as authorization when the latest chat message has no linked task', async () => {
+    window.localStorage.setItem('unbound.conversation_id', session.session_id)
+    state.api.getConversation.mockResolvedValueOnce({
+      ...session,
+      messages: [{ message_id: 'assistant-clarification', role: 'assistant', content: 'Please provide a valid path.' }],
+    })
+    state.api.getConversationTaskReferences.mockResolvedValueOnce({
+      session_id: session.session_id,
+      available_task_ids: ['unrelated-old-task'],
+      unavailable_task_ids: [],
+    })
+    render(<App />)
+
+    const input = await screen.findByPlaceholderText(/ask a question/i)
+    fireEvent.change(input, { target: { value: 'approve' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    expect(await screen.findByText(/could not match that response to a task/i)).toBeTruthy()
+    expect(state.api.getTask).not.toHaveBeenCalled()
+    expect(state.api.decideApproval).not.toHaveBeenCalled()
+    expect(state.api.classifyAssistantRequest).not.toHaveBeenCalled()
+    expect(state.api.assistantRequest).not.toHaveBeenCalled()
+    expect(state.api.executeTask).not.toHaveBeenCalled()
   })
 
   it('clearly reports linked tasks unavailable after a backend restart', async () => {

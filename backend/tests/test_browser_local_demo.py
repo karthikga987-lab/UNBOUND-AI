@@ -120,6 +120,74 @@ def test_assistant_prepares_fixed_local_demo_plan_without_llm_generated_targets(
     assert result["task"].get("pending_approvals", []) == []
 
 
+def test_exact_local_demo_url_executes_through_assistant_api_and_executor(monkeypatch, tmp_path):
+    """The exact fixture URL must keep the typed navigate schema end to end."""
+    from fastapi.testclient import TestClient
+    from backend.app.assistant.intent import AssistantIntent, AssistantIntentCategory
+
+    monkeypatch.setenv("UNBOUND_BROWSER_LOCAL_DEMO", "1")
+    monkeypatch.setenv("UNBOUND_BROWSER_LOCAL_DEMO_HEADLESS", "1")
+    monkeypatch.setenv("BROWSER_REPLAY_STATE_KEY", "test:" + base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("="))
+    monkeypatch.setenv("UNBOUND_BROWSER_WORKFLOW_DIR", str(tmp_path / "workflows"))
+    monkeypatch.setenv("UNBOUND_CONVERSATION_DB", str(tmp_path / "conversations.sqlite3"))
+    monkeypatch.setenv("UNBOUND_DOCUMENT_STORAGE", str(tmp_path / "documents.sqlite3"))
+
+    runtime = TaskRuntime()
+    runtime.register_document_tools()
+    runtime.provider = object()  # Intent is stubbed; the browser controller is real.
+    monkeypatch.setattr(
+        "backend.app.api.routes.assistant.classify_assistant_intent",
+        lambda *_args, **_kwargs: AssistantIntent(
+            category=AssistantIntentCategory.ACTION_EXECUTION,
+            current_turn_authorizes_execution=True,
+        ),
+    )
+
+    with TestClient(create_app(runtime)) as client:
+        response = client.post("/api/assistant/requests", json={
+            "message": "Open http://unbound-demo.invalid/product and tell me its main heading, version, and features."
+        })
+        assert response.status_code == 200
+        task = response.json()["task"]
+        assert len(task["plan"]) == 1
+        assert task["plan"][0]["tool_name"] == "browser.navigate"
+        assert task["plan"][0]["input"] == {"url": LOCAL_DEMO_PRODUCT_URL}
+        executed = client.post(f"/api/tasks/{task['task_id']}/execute")
+
+    assert executed.status_code == 200
+    result = executed.json()
+    assert result["status"] == TaskStatus.COMPLETED.value
+    assert result["plan"][0]["status"] == "completed"
+    assert result["plan"][0]["verification"]["verified"] is True
+    observation = result["plan"][0]["verification"]["tool_result"]["page_observation"]
+    assert observation["url"] == LOCAL_DEMO_PRODUCT_URL
+    assert observation["title"] == "Demo Product"
+    assert "Version: 2.1" in observation["visible_text"]
+    assert len(result["evidence"]) == 1
+
+
+def test_local_demo_url_reports_missing_opt_in_instead_of_generic_tool_failure(monkeypatch, tmp_path):
+    from uuid import uuid4
+    from backend.app.browser.tools import BrowserNavigateInput
+    from backend.app.schemas.contracts import ToolCall
+
+    monkeypatch.delenv("UNBOUND_BROWSER_LOCAL_DEMO", raising=False)
+    monkeypatch.setenv("UNBOUND_BROWSER_WORKFLOW_DIR", str(tmp_path / "workflows"))
+    runtime = TaskRuntime()
+    runtime.initialize_browser_integration()
+    try:
+        call = ToolCall(
+            task_id=uuid4(), step_id="navigate", tool_name="browser.navigate",
+            arguments={"url": LOCAL_DEMO_PRODUCT_URL},
+        )
+        result = runtime.registry.execute(call)
+        assert result.success is False
+        assert result.data == {"failure_code": "local_demo_mode_not_enabled"}
+        assert "UNBOUND_BROWSER_LOCAL_DEMO=1" in result.error
+    finally:
+        runtime.shutdown()
+
+
 def test_local_demo_plan_never_rewrites_an_explicit_external_url(monkeypatch, tmp_path):
     from backend.app.orchestrator.planner import _local_demo_research_plan
 

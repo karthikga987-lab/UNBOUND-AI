@@ -311,8 +311,19 @@ class TaskRuntime:
             # and does not alter, the public egress approval gate above.
             if os.getenv("UNBOUND_BROWSER_LOCAL_DEMO") == "1" and self._is_local_demo_action(tool_name, arguments):
                 return execute(arguments, tool_call)
+            if tool_name == "browser.navigate":
+                from backend.app.browser.tools import BrowserNavigateInput
+                if isinstance(arguments, BrowserNavigateInput):
+                    from backend.app.browser.egress import LOCAL_DEMO_PRODUCT_URL
+                    if str(arguments.url) == LOCAL_DEMO_PRODUCT_URL and os.getenv("UNBOUND_BROWSER_LOCAL_DEMO") != "1":
+                        return ToolResult(
+                            success=False,
+                            data={"failure_code": "local_demo_mode_not_enabled"},
+                            error="The fixed local browser demo is disabled; start the backend with UNBOUND_BROWSER_LOCAL_DEMO=1.",
+                        )
             return ToolResult(
                 success=False,
+                data={"failure_code": "browser_execution_disabled"},
                 error="Browser action is disabled; public egress has not been approved and the local demo permits only its fixed fixture actions",
             )
 
