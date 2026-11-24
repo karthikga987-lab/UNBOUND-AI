@@ -3,11 +3,13 @@ import { api, MOCK_AREAS, USE_MOCK } from './api'
 import ChatPanel from './components/ChatPanel'
 import DataPanel from './components/DataPanel'
 import TaskWorkspace from './components/TaskWorkspace'
+import TaskHistoryPanel from './components/TaskHistoryPanel'
 import WorkflowPanel from './components/WorkflowPanel'
 import { Card, EmptyState, StatusBadge } from './components/ui'
 
 const TABS = [
   { id: 'workflows', label: 'Workflows' },
+  { id: 'tasks', label: 'Task history' },
   { id: 'data', label: 'Connected data' },
 ]
 
@@ -21,10 +23,16 @@ export default function App() {
   const [unavailableTaskCount, setUnavailableTaskCount] = useState(0)
   const [tab, setTab] = useState('workflows')
   const [health, setHealth] = useState('checking')
+  const [browserStatus, setBrowserStatus] = useState(null)
 
   useEffect(() => {
     let alive = true
-    api.health().then(() => alive && setHealth('online'), () => alive && setHealth('offline'))
+    api.health().then((result) => {
+      if (alive) {
+        setHealth('online')
+        setBrowserStatus(result)
+      }
+    }, () => alive && setHealth('offline'))
     const restoreConversation = async () => {
       try {
         const savedId = window.localStorage.getItem('unbound.conversation_id')
@@ -199,6 +207,15 @@ export default function App() {
             )}
             <span className="hidden text-slate-400 sm:inline">Backend</span>
             <StatusBadge status={health} />
+            {health === 'online' && (
+              <span className="hidden rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-amber-300 md:inline">
+                {browserStatus?.browser_public_execution_enabled
+                  ? 'Public browser enabled'
+                  : browserStatus?.browser_local_demo_enabled
+                    ? 'Local Demo Mode · public browsing disabled'
+                    : 'Public browsing disabled'}
+              </span>
+            )}
           </div>
         </div>
       </header>
@@ -249,6 +266,9 @@ export default function App() {
           {/* Both stay mounted so an in-progress recording is not lost when switching tabs. */}
           <div className={tab === 'workflows' ? '' : 'hidden'}>
             <WorkflowPanel onTaskStarted={trackTask} />
+          </div>
+          <div className={tab === 'tasks' ? '' : 'hidden'}>
+            <TaskHistoryPanel onSelect={setActiveTaskId} />
           </div>
           <div className={tab === 'data' ? '' : 'hidden'}>
             <DataPanel />

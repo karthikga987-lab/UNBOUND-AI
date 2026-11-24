@@ -66,11 +66,20 @@ class S3DocumentService:
         if client is None:
             try:
                 import boto3
+                from botocore.config import Config
                 from botocore.exceptions import BotoCoreError, ProfileNotFound
 
                 try:
                     session = boto3.Session(profile_name=profile, region_name=region)
-                    client = session.client("s3", region_name=region)
+                    client = session.client(
+                        "s3",
+                        region_name=region,
+                        config=Config(
+                            connect_timeout=5,
+                            read_timeout=30,
+                            retries={"total_max_attempts": 3, "mode": "standard"},
+                        ),
+                    )
                 except (BotoCoreError, ProfileNotFound) as exc:
                     raise S3StorageError("credentials_unavailable", "AWS profile credentials are unavailable") from exc
             except ImportError as exc:
@@ -121,6 +130,7 @@ class S3DocumentService:
                 Body=content,
                 ContentType=content_type,
                 Metadata={"sha256": digest},
+                ServerSideEncryption="AES256",
                 IfNoneMatch="*",
             )
             head = self._client.head_object(Bucket=self.bucket, Key=key)

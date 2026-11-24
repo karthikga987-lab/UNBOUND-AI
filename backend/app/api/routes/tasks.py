@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Literal
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict
 
 from backend.app.llm.provider import LLMConfigurationError, LLMProviderError
@@ -18,6 +18,12 @@ router = APIRouter(prefix="/tasks")
 class ApprovalDecisionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     decision: Literal["APPROVED", "REJECTED"]
+
+
+@router.get("", response_model=list[TaskResponse])
+def list_tasks(request: Request, limit: int = Query(default=100, ge=1, le=200)) -> list[TaskResponse]:
+    """Return local persisted task history using public-safe projections."""
+    return request.app.state.runtime.manager.list_tasks(limit)
 
 
 def _task_or_404(runtime, task_id: UUID) -> TaskResponse:

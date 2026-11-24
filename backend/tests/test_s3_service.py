@@ -60,6 +60,7 @@ def test_upload_requires_explicit_confirmation_and_verifies_head_metadata():
     assert client.calls[0][3]["Metadata"] == {"sha256": receipt.sha256}
     assert client.calls[0][3]["IfNoneMatch"] == "*"
     assert "ACL" not in client.calls[0][3]
+    assert client.calls[0][3]["ServerSideEncryption"] == "AES256"
 
 
 @pytest.mark.parametrize("name", ["../escape.txt", "a/../../escape", "unbound/../escape", "\\server\\share", "bad\\name", "/absolute", "a//b", "a/./b", "x\nheader"])

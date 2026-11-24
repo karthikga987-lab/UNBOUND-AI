@@ -26,5 +26,43 @@ Run the synthetic live round trip from the repository root:
 The first flag authorizes one generated synthetic upload. The second authorizes
 deletion of only that run's unique test object after it is downloaded and
 hash-checked. Without `--cleanup-approved`, the object remains in the bucket.
-This smoke script is not exposed to the model or frontend. S3 upload, listing,
-and download are not yet wired into the React UI or assistant/task ToolRegistry.
+This smoke script is not exposed to the model or frontend. Document S3 APIs are
+not wired into the assistant/task ToolRegistry.
+
+## Manual task database backup
+
+Task history uses a separate SQLite database at
+`%LOCALAPPDATA%\UNBOUND_AI\tasks.sqlite3` by default. Backups are a manual
+operation; this is not background or bidirectional synchronization. The
+snapshot uses SQLite's online backup API, so a running backend may continue to
+write in WAL mode. The compressed archive is bounded to the service's 20 MiB
+limit and contains only the task database and a versioned integrity manifest.
+It does not include conversations, documents, reminders, browser profiles, or
+the browser replay encryption key.
+
+Upload requires an explicit flag and creates a new, non-overwriting object
+under `unbound/backups/`. The request asks S3 for SSE-S3 encryption and HEAD
+verification checks size and SHA-256 metadata. Restore verifies the manifest,
+database checksum, and SQLite integrity and only creates a new destination;
+it refuses to target the active database or overwrite an existing path.
+
+```powershell
+# Upload a consistent snapshot; review the disclosure before confirming.
+.\.venv-wake\Scripts\python.exe scripts\s3_task_backup.py --upload --confirm-upload
+
+# Restore an existing object into a separate, previously unused path.
+.\.venv-wake\Scripts\python.exe scripts\s3_task_backup.py --restore-key unbound/backups/OBJECT.zip --destination "$env:TEMP\unbound-task-recovery.sqlite3" --confirm-restore
+```
+
+The tool uses the configured `unbound-ai-local` profile, bucket, region, and
+existing bounded `unbound/` service. A live synthetic SQLite upload, HEAD
+verification, download, restore to a temporary separate path, checksum
+comparison, and SQLite integrity check succeeded. The S3 object reported
+`AES256` server-side encryption. The object key is
+`unbound/backups/synthetic-verification-47caea65-1f7b-40d8-be7e-9e270a64de76.zip`
+and was deliberately retained; no remote deletion was authorized. Prefix
+listing succeeded. `s3:GetBucketLocation` and `s3:GetBucketVersioning` were
+denied, so bucket-region metadata and versioning configuration were not
+independently queried (uploads/downloads through the configured ap-south-1
+client did succeed). No bucket is made public. There is no S3 dashboard,
+background retry loop, or automatic sync.

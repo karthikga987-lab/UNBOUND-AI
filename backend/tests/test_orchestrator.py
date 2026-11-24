@@ -434,6 +434,28 @@ def test_executor_blocks_step_with_unverified_dependency():
     assert calls == []
 
 
+def test_executor_verifies_evidence_step_before_running_dependent_step():
+    calls = []
+    manager = TaskManager()
+    first = search_step("s1", query="one")
+    second = search_step("s2", query="two")
+    second.depends_on = ["s1"]
+    task = create_task(manager, "Run sequential evidence search", [first, second])
+    executor = TaskExecutor(
+        manager,
+        registry(lambda arguments, call: calls.append(call.step_id) or successful_search(arguments, call)),
+        verifier,
+    )
+
+    result = executor.run(task.task_id)
+
+    assert result.status == TaskStatus.COMPLETED
+    assert [step.status for step in result.plan] == [StepStatus.COMPLETED, StepStatus.COMPLETED]
+    assert result.completed_steps == ["s1", "s2"]
+    assert calls == ["s1", "s2"]
+    assert len(result.evidence) == 2
+
+
 def test_task_state_transitions_and_uuid4_cancellation_event():
     manager = TaskManager()
     task = create_task(manager, "Find report", [])

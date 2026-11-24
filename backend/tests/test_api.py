@@ -89,6 +89,9 @@ def test_application_starts_without_llm_credentials_and_health_is_honest(monkeyp
         "registered_tools_count": 4,
         "notification_agent_installed": False,
         "notification_agent_running": False,
+        "browser_public_execution_enabled": False,
+        "browser_integration_status": "not_initialized",
+        "browser_local_demo_enabled": False,
     }
 
 
@@ -103,6 +106,18 @@ def test_task_creation_retrieval_and_shared_runtime_state():
     assert retrieved.json()["task_id"] == task_id
     assert len(retrieved.json()["plan"]) == 1
     assert client.get("/api/health").json()["registered_tools_count"] == 1
+
+
+def test_task_history_endpoint_returns_public_task_snapshots():
+    runtime, _ = planned_runtime()
+    client = TestClient(create_app(runtime))
+    created = client.post("/api/tasks", json={"user_request": "Find the quarterly report"})
+    assert created.status_code == 200
+
+    history = client.get("/api/tasks?limit=10")
+    assert history.status_code == 200
+    assert [task["task_id"] for task in history.json()] == [created.json()["task_id"]]
+    assert history.json()[0]["user_request"] == "Find the quarterly report"
 
 
 def test_conversational_question_is_rejected_by_task_endpoint_without_creating_task():

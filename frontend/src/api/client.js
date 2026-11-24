@@ -75,6 +75,7 @@ export const realApi = {
 
   createTask: (userRequest, autoExecute = false) =>
     request('/tasks', { method: 'POST', body: { user_request: userRequest, auto_execute: autoExecute } }),
+  listTasks: (limit = 100) => request(`/tasks?limit=${encodeURIComponent(limit)}`),
   getTask: (taskId) => request(`/tasks/${taskId}`),
   getTaskEvents: (taskId) => request(`/tasks/${taskId}/events`),
   executeTask: (taskId) => request(`/tasks/${taskId}/execute`, { method: 'POST' }),

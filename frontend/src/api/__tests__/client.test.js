@@ -9,6 +9,13 @@ afterEach(() => vi.unstubAllGlobals())
 const respond = (status, body) => vi.fn().mockResolvedValue({ ok: status < 400, status, text: async () => JSON.stringify(body) })
 
 describe('realApi', () => {
+  it('loads bounded persisted task history', async () => {
+    const fetch = respond(200, [])
+    vi.stubGlobal('fetch', fetch)
+    await realApi.listTasks(25)
+    expect(fetch.mock.calls[0][0]).toBe('/api/tasks?limit=25')
+  })
+
   it('loads task references scoped to a conversation session', async () => {
     const fetch = respond(200, { session_id: 'session-1', available_task_ids: ['task-1'], unavailable_task_ids: [] })
     vi.stubGlobal('fetch', fetch)

@@ -13,6 +13,7 @@ const state = vi.hoisted(() => ({
     sendConversationMessage: vi.fn(),
     assistantRequest: vi.fn(),
     createTask: vi.fn(),
+    listTasks: vi.fn(),
     executeTask: vi.fn(),
     cancelTask: vi.fn(),
   },
@@ -53,6 +54,7 @@ beforeEach(() => {
   state.api.getConversation.mockResolvedValue({ ...session, messages: [] })
   state.api.getConversationTaskReferences.mockResolvedValue({ session_id: session.session_id, available_task_ids: [], unavailable_task_ids: [] })
   state.api.getTask.mockResolvedValue({ task_id: 'task-1', status: 'created', pending_approvals: [], plan: [] })
+  state.api.listTasks.mockResolvedValue([])
   state.api.decideApproval.mockResolvedValue({ task_id: 'task-1', status: 'created', pending_approvals: [], plan: [] })
   state.api.classifyAssistantRequest.mockResolvedValue({ category: 'information' })
   state.api.sendConversationMessage.mockResolvedValue({
@@ -74,6 +76,20 @@ afterEach(() => {
 })
 
 describe('React assistant chat routing', () => {
+  it('loads persisted task history and opens a selected task', async () => {
+    state.api.listTasks.mockResolvedValueOnce([{
+      task_id: 'stored-task-1',
+      user_request: 'Analyze the synthetic report',
+      status: 'completed',
+      updated_at: '2026-11-25T10:00:00Z',
+    }])
+    render(<App />)
+    await screen.findByRole('button', { name: /Analyze the synthetic report/i })
+    fireEvent.click(screen.getByRole('button', { name: /Analyze the synthetic report/i }))
+    expect((await screen.findByTestId('task-workspace')).textContent).toContain('stored-task-1')
+    expect(state.api.listTasks).toHaveBeenCalledWith(100)
+  })
+
   it('restores a session and routes ordinary questions through the persistent conversation API without creating a task', async () => {
     window.localStorage.setItem('unbound.conversation_id', session.session_id)
     render(<App />)

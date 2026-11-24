@@ -256,6 +256,11 @@ class TaskExecutor:
                     "Tool evidence retained; outcome verification is still pending", step.step_id, evidence_ids,
                 )
                 task = self._save_task(task)
+                # Saving returns a fresh TaskResponse snapshot. Rebind the step
+                # before verification so subsequent status changes are applied
+                # to the plan that will be persisted, not the stale pre-save
+                # TaskStep instance.
+                step = next(item for item in task.plan if item.step_id == call.step_id)
 
             if not result.success:
                 # Keep only allowlisted diagnostic fields for the local-file

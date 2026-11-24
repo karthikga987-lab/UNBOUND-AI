@@ -50,7 +50,9 @@ _BROWSER_EGRESS_SECURITY_APPROVED = False
 class TaskRuntime:
     """One process-local set of orchestration services.
 
-    Tasks and approvals are currently held in memory and do not survive restarts.
+    Conversation and document state use their existing SQLite stores. Tasks,
+    task events, and approval decisions are stored in a separate SQLite task
+    repository. In-flight external effects are recovered as needs-attention.
     """
 
     manager: TaskManager = field(default_factory=TaskManager)

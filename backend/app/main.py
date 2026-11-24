@@ -19,6 +19,7 @@ from backend.app.api.routes.reminders import router as reminders_router
 from backend.app.api.routes.tasks import router as tasks_router
 from backend.app.api.routes.wake_word import router as wake_word_router
 from backend.app.api.runtime import TaskRuntime
+from backend.app.orchestrator.task_manager import SQLiteTaskRepository, TaskManager
 
 logger = logging.getLogger(__name__)
 ALLOWED_LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "testserver"}
@@ -151,7 +152,7 @@ class LocalPrototypeSecurityMiddleware:
 
 
 def create_app(runtime: TaskRuntime | None = None) -> FastAPI:
-    selected_runtime = runtime or TaskRuntime()
+    selected_runtime = runtime or TaskRuntime(manager=TaskManager(SQLiteTaskRepository()))
     if runtime is None:
         selected_runtime.register_document_tools()
 

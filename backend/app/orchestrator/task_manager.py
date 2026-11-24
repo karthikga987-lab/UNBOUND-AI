@@ -6,6 +6,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import json
 import ntpath
+import os
+import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 from threading import Lock, RLock
 from typing import Callable, Iterator
@@ -86,6 +89,144 @@ class InMemoryTaskRepository:
                 raise KeyError(f"Task '{key}' not found")
             return self._tasks[key].model_copy(deep=True)
 
+    def list_tasks(self, limit: int = 100) -> list[TaskResponse]:
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 500:
+            raise ValueError("limit must be between 1 and 500")
+        with self._lock:
+            return [task.model_copy(deep=True) for task in list(self._tasks.values())[-limit:]]
+
+
+def default_task_database_path() -> Path:
+    configured = os.getenv("UNBOUND_TASK_DB")
+    if configured:
+        return Path(configured).expanduser()
+    if os.name == "nt":
+        base = Path(os.getenv("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    else:
+        base = Path(os.getenv("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+    return base / "UNBOUND_AI" / "tasks.sqlite3"
+
+
+class SQLiteTaskRepository:
+    """Durable task/event repository using one transaction per state update.
+
+    Sensitive execution state is stored locally in SQLite and is never returned
+    directly by this repository through the public API. Browser replay grants
+    remain process-local and are deliberately not persisted.
+    """
+
+    def __init__(self, database_path: str | Path | None = None) -> None:
+        self.database_path = Path(database_path) if database_path is not None else default_task_database_path()
+        self._lock = RLock()
+        self._initialize()
+
+    def _connect(self) -> sqlite3.Connection:
+        self.database_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        connection = sqlite3.connect(self.database_path, timeout=10, isolation_level="IMMEDIATE")
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA busy_timeout=10000")
+        connection.execute("PRAGMA secure_delete=ON")
+        if os.name != "nt":
+            os.chmod(self.database_path, 0o600)
+        return connection
+
+    @contextmanager
+    def _connection(self):
+        connection = self._connect()
+        try:
+            yield connection
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def _initialize(self) -> None:
+        with self._lock, self._connection() as connection:
+            connection.executescript("""
+                CREATE TABLE IF NOT EXISTS tasks (
+                    task_id TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS task_events (
+                    task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+                    sequence INTEGER NOT NULL,
+                    event_id TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    PRIMARY KEY(task_id, sequence),
+                    UNIQUE(task_id, event_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_task_events_event ON task_events(task_id, sequence);
+                CREATE TABLE IF NOT EXISTS task_runtime_state (
+                    task_id TEXT PRIMARY KEY REFERENCES tasks(task_id) ON DELETE CASCADE,
+                    payload TEXT NOT NULL
+                );
+            """)
+
+    def save(self, task: TaskResponse) -> TaskResponse:
+        payload = task.model_dump_json()
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                "INSERT INTO tasks(task_id,payload,updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(task_id) DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at",
+                (str(task.task_id), payload, task.updated_at.isoformat()),
+            )
+        return task.model_copy(deep=True)
+
+    def get(self, task_id: UUID | str) -> TaskResponse:
+        key = normalize_task_id(task_id)
+        with self._lock, self._connection() as connection:
+            row = connection.execute("SELECT payload FROM tasks WHERE task_id=?", (str(key),)).fetchone()
+        if row is None:
+            raise KeyError(f"Task '{key}' not found")
+        return TaskResponse.model_validate_json(row["payload"])
+
+    def list_tasks(self, limit: int = 100) -> list[TaskResponse]:
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 500:
+            raise ValueError("limit must be between 1 and 500")
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                "SELECT payload FROM tasks ORDER BY updated_at DESC,task_id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [TaskResponse.model_validate_json(row["payload"]) for row in reversed(rows)]
+
+    def save_event(self, event: ExecutionEvent) -> None:
+        with self._lock, self._connection() as connection:
+            sequence = connection.execute(
+                "SELECT COALESCE(MAX(sequence),0)+1 FROM task_events WHERE task_id=?", (str(event.task_id),)
+            ).fetchone()[0]
+            connection.execute(
+                "INSERT INTO task_events(task_id,sequence,event_id,payload) VALUES(?,?,?,?)",
+                (str(event.task_id), sequence, str(event.event_id), event.model_dump_json()),
+            )
+
+    def load_events(self, task_id: UUID | str) -> list[ExecutionEvent]:
+        key = normalize_task_id(task_id)
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                "SELECT payload FROM task_events WHERE task_id=? ORDER BY sequence", (str(key),)
+            ).fetchall()
+        return [ExecutionEvent.model_validate_json(row["payload"]) for row in rows]
+
+    def save_runtime_state(self, task_id: UUID | str, state: dict) -> None:
+        key = normalize_task_id(task_id)
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                "INSERT INTO task_runtime_state(task_id,payload) VALUES(?,?) "
+                "ON CONFLICT(task_id) DO UPDATE SET payload=excluded.payload",
+                (str(key), json.dumps(state, ensure_ascii=False, separators=(",", ":"))),
+            )
+
+    def load_runtime_state(self, task_id: UUID | str) -> dict:
+        key = normalize_task_id(task_id)
+        with self._lock, self._connection() as connection:
+            row = connection.execute("SELECT payload FROM task_runtime_state WHERE task_id=?", (str(key),)).fetchone()
+        return json.loads(row["payload"]) if row else {}
+
 
 class TaskManager:
     def __init__(
@@ -119,6 +260,72 @@ class TaskManager:
         self._replay_dispatch_locks: dict[UUID4, Lock] = {}
         self._terminal_callbacks: list[Callable[[UUID4, TaskStatus], None]] = []
         self._lock = RLock()
+        self._restore_persisted_state()
+
+    def _persist_runtime_state(self, task_id: UUID4) -> None:
+        saver = getattr(self.repository, "save_runtime_state", None)
+        if not callable(saver):
+            return
+        with self._lock:
+            state = {
+                "missing_information": self._missing_information.get(task_id, []),
+                "auto_execute": self._auto_execute.get(task_id, False),
+                "tool_calls": [item.model_dump(mode="json") for item in self._tool_calls.get(task_id, [])],
+                "approval_history": [item.model_dump(mode="json") for item in self._approval_history.get(task_id, [])],
+                "consumed_approvals": [str(item) for item in self._consumed_approvals if any(
+                    approval.approval_id == item for approval in self._approval_history.get(task_id, [])
+                )],
+            }
+        saver(task_id, state)
+
+    def _restore_persisted_state(self) -> None:
+        loader = getattr(self.repository, "list_tasks", None)
+        if not callable(loader):
+            return
+        for task in loader():
+            key = task.task_id
+            state_loader = getattr(self.repository, "load_runtime_state", None)
+            state = state_loader(key) if callable(state_loader) else {}
+            event_loader = getattr(self.repository, "load_events", None)
+            self._events[key] = event_loader(key) if callable(event_loader) else []
+            self._missing_information[key] = list(state.get("missing_information", []))
+            self._auto_execute[key] = state.get("auto_execute") is True
+            self._tool_calls[key] = [ToolCall.model_validate(item) for item in state.get("tool_calls", [])]
+            self._approval_history[key] = [ApprovalRequest.model_validate(item) for item in state.get("approval_history", [])]
+            self._consumed_approvals.update(UUID(item) for item in state.get("consumed_approvals", []))
+            # Browser replay continuations are intentionally process-local. A
+            # pending replay approval cannot be resumed after restart without
+            # its trusted bridge capability, so fail closed and require review.
+            replay_pending = [item for item in task.pending_approvals if item.tool_name == "browser.replay"]
+            expired_pending = [item for item in task.pending_approvals if self._approval_expired(item)]
+            interrupted = task.status in {TaskStatus.EXECUTING, TaskStatus.VERIFYING} or any(
+                step.status == StepStatus.RUNNING for step in task.plan
+            )
+            if interrupted or replay_pending or expired_pending:
+                for step in task.plan:
+                    if step.status == StepStatus.RUNNING:
+                        step.status = StepStatus.FAILED
+                        step.error = "Execution was interrupted by backend restart; external outcome is unknown"
+                invalid_approvals = {item.approval_id for item in (*replay_pending, *expired_pending)}
+                for approval in (*replay_pending, *expired_pending):
+                    approval.status = ApprovalStatus.CANCELLED
+                    self._approval_history[key].append(approval.model_copy(deep=True))
+                task.pending_approvals = [item for item in task.pending_approvals if item.approval_id not in invalid_approvals]
+                task.status = TaskStatus.NEEDS_ATTENTION
+                task.current_step = None
+                task.error = "Task was interrupted by backend restart; review before executing any remaining action"
+                self.repository.save(task)
+                event = ExecutionEvent(
+                    task_id=key,
+                    event_type="task.recovered_needs_attention",
+                    message="Interrupted execution will not be retried automatically; review the task before continuing",
+                    status=EventStatus.NEEDS_ATTENTION,
+                )
+                event_saver = getattr(self.repository, "save_event", None)
+                if callable(event_saver):
+                    event_saver(event)
+                self._events[key].append(event)
+                self._persist_runtime_state(key)
 
     @contextmanager
     def execution_lock(self, task_id: UUID | str) -> Iterator[None]:
@@ -209,6 +416,8 @@ class TaskManager:
             self._auto_execute[task_id] = request.auto_execute
             self._tool_calls[task_id] = []
             self._approval_history[task_id] = []
+        self.repository.save(task)
+        self._persist_runtime_state(task_id)
         if missing:
             self.event(
                 task,
@@ -218,7 +427,6 @@ class TaskManager:
             )
         else:
             self.event(task, "task.created", EventStatus.CREATED, "Task created")
-        self.repository.save(task)
         return self._public_task(task)
 
     @staticmethod
@@ -254,11 +462,18 @@ class TaskManager:
         )
         with self._lock:
             self._events.setdefault(task.task_id, []).append(event)
+            event_saver = getattr(self.repository, "save_event", None)
+            if callable(event_saver):
+                event_saver(event)
+        self._persist_runtime_state(task.task_id)
         return event
 
     def events(self, task_id: UUID | str) -> list[ExecutionEvent]:
         key = normalize_task_id(task_id)
         with self._lock:
+            loader = getattr(self.repository, "load_events", None)
+            if callable(loader):
+                return loader(key)
             return [event.model_copy(deep=True) for event in self._events.get(key, [])]
 
     def missing_information(self, task_id: UUID | str) -> list[str]:
@@ -722,6 +937,7 @@ class TaskManager:
                 if approved is None:
                     return False
                 self._consumed_approvals.add(approved.approval_id)
+                self._persist_runtime_state(key)
             task.status = TaskStatus.EXECUTING
             task.current_step = call.step_id
             step.status = StepStatus.RUNNING
@@ -748,6 +964,7 @@ class TaskManager:
                 task.status = TaskStatus.CANCELLED
             task.updated_at = utc_now()
             saved = self.repository.save(task)
+            self._persist_runtime_state(task.task_id)
         self.notify_task_terminal(task.task_id)
         return self._public_task(saved) if public else saved
 
@@ -756,6 +973,13 @@ class TaskManager:
 
     def get_for_execution(self, task_id: UUID | str) -> TaskResponse:
         return self.repository.get(task_id)
+
+    def list_tasks(self, limit: int = 100) -> list[TaskResponse]:
+        """List persisted tasks as redacted public responses."""
+        loader = getattr(self.repository, "list_tasks", None)
+        if not callable(loader):
+            return []
+        return [self._public_task(task) for task in loader(limit)]
 
     @staticmethod
     def _public_task(task: TaskResponse) -> TaskResponse:

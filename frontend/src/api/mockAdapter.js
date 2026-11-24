@@ -183,6 +183,11 @@ export const mockApi = {
     return { status: 'ok' }
   },
 
+  async listTasks() {
+    await wait(80)
+    return [...tasks.values()].map((entry) => copy(entry.task))
+  },
+
   async getConversationTaskReferences(sessionId) {
     return { session_id: sessionId, available_task_ids: [], unavailable_task_ids: [] }
   },

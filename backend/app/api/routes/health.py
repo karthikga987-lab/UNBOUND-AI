@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Request
+import os
 
 
 router = APIRouter()
@@ -15,4 +16,7 @@ def health(request: Request) -> dict[str, object]:
         "registered_tools_count": runtime.registered_tools_count(),
         "notification_agent_installed": notification["installed"],
         "notification_agent_running": notification["running"],
+        "browser_public_execution_enabled": runtime.browser_egress_security_enabled,
+        "browser_integration_status": runtime.browser_integration_status,
+        "browser_local_demo_enabled": os.getenv("UNBOUND_BROWSER_LOCAL_DEMO") == "1",
     }
