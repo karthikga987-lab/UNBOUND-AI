@@ -155,6 +155,18 @@ class S3DocumentService:
                 objects.append(S3ObjectInfo(key=key, size_bytes=int(item.get("Size", 0)), last_modified=item.get("LastModified")))
         return objects[:limit]
 
+    def verify_existing_object(self, name: str, *, size_bytes: int, sha256_digest: str) -> bool:
+        """Verify an already-present content-addressed object for idempotent sync."""
+        key = self.object_key(name)
+        try:
+            head = self._client.head_object(Bucket=self.bucket, Key=key)
+        except Exception as exc:
+            raise self._safe_aws_error(exc, "verification_failed", "Existing S3 object could not be verified") from exc
+        metadata = head.get("Metadata") or {}
+        if head.get("ContentLength") != size_bytes or metadata.get("sha256") != sha256_digest:
+            raise S3StorageError("object_integrity_mismatch", "Existing S3 object did not match the expected checksum")
+        return True
+
     def download_to_fileobj(self, name: str, destination: BinaryIO) -> S3ObjectInfo:
         """Stream one bounded object to a caller-owned destination file object."""
         if not callable(getattr(destination, "write", None)):

@@ -16,6 +16,24 @@ describe('realApi', () => {
     expect(fetch.mock.calls[0][0]).toBe('/api/tasks?limit=25')
   })
 
+  it('uses explicit confirmation for private S3 sync and safe restore routes', async () => {
+    const fetch = respond(200, { enabled: true, status: 'synchronized' })
+    vi.stubGlobal('fetch', fetch)
+    await realApi.s3SyncStatus()
+    expect(fetch.mock.calls[0][0]).toBe('/api/storage/s3/status')
+    await realApi.syncToS3()
+    expect(fetch.mock.calls[1][0]).toBe('/api/storage/s3/sync')
+    expect(JSON.parse(fetch.mock.calls[1][1].body)).toEqual({ confirm_sync: true })
+    fetch.mockResolvedValueOnce({ ok: true, status: 200, text: async () => '[]' })
+    await realApi.listS3Backups()
+    expect(fetch.mock.calls[2][0]).toBe('/api/storage/s3/backups')
+    fetch.mockResolvedValueOnce({ ok: true, status: 200, text: async () => JSON.stringify({ verified: true }) })
+    await realApi.restoreTaskBackup('unbound/backups/synthetic.zip')
+    expect(JSON.parse(fetch.mock.calls[3][1].body)).toEqual({
+      object_key: 'unbound/backups/synthetic.zip', confirm_restore: true,
+    })
+  })
+
   it('loads task references scoped to a conversation session', async () => {
     const fetch = respond(200, { session_id: 'session-1', available_task_ids: ['task-1'], unavailable_task_ids: [] })
     vi.stubGlobal('fetch', fetch)

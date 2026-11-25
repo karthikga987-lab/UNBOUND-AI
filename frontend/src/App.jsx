@@ -4,6 +4,7 @@ import ChatPanel from './components/ChatPanel'
 import DataPanel from './components/DataPanel'
 import TaskWorkspace from './components/TaskWorkspace'
 import TaskHistoryPanel from './components/TaskHistoryPanel'
+import S3SyncPanel from './components/S3SyncPanel'
 import WorkflowPanel from './components/WorkflowPanel'
 import { Card, EmptyState, StatusBadge } from './components/ui'
 
@@ -11,6 +12,7 @@ const TABS = [
   { id: 'workflows', label: 'Workflows' },
   { id: 'tasks', label: 'Task history' },
   { id: 'data', label: 'Connected data' },
+  { id: 'storage', label: 'S3 backup' },
 ]
 
 export default function App() {
@@ -210,10 +212,10 @@ export default function App() {
             {health === 'online' && (
               <span className="hidden rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-amber-300 md:inline">
                 {browserStatus?.browser_public_execution_enabled
-                  ? 'Public browser enabled'
+                  ? 'Public browsing enabled · containment verified'
                   : browserStatus?.browser_local_demo_enabled
-                    ? 'Local Demo Mode · public browsing disabled'
-                    : 'Public browsing disabled'}
+                    ? 'Local Demo Mode · public blocked pending process containment'
+                    : 'Public browsing blocked · process containment unverified'}
               </span>
             )}
           </div>
@@ -272,6 +274,9 @@ export default function App() {
           </div>
           <div className={tab === 'data' ? '' : 'hidden'}>
             <DataPanel />
+          </div>
+          <div className={tab === 'storage' ? '' : 'hidden'}>
+            <S3SyncPanel />
           </div>
         </aside>
       </main>

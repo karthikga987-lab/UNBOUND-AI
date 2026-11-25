@@ -182,6 +182,10 @@ export const mockApi = {
     await wait(100)
     return { status: 'ok' }
   },
+  async s3SyncStatus() { return { enabled: false, status: 'simulated', pending_count: 0, retry_count: 0 } },
+  async listS3Backups() { return [] },
+  async syncToS3() { throw new Error('S3 synchronization is unavailable in simulated mode.') },
+  async restoreTaskBackup() { throw new Error('S3 restore is unavailable in simulated mode.') },
 
   async listTasks() {
     await wait(80)

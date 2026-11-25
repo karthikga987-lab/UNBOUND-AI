@@ -19,4 +19,9 @@ def health(request: Request) -> dict[str, object]:
         "browser_public_execution_enabled": runtime.browser_egress_security_enabled,
         "browser_integration_status": runtime.browser_integration_status,
         "browser_local_demo_enabled": os.getenv("UNBOUND_BROWSER_LOCAL_DEMO") == "1",
+        "browser_public_execution_status": (
+            "enabled_verified" if runtime.browser_egress_security_enabled
+            else "blocked_missing_process_containment"
+        ),
+        "s3_sync": runtime.s3_sync_status(),
     }

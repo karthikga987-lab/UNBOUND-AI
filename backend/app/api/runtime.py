@@ -76,6 +76,9 @@ class TaskRuntime:
     browser_replay_bridge: object | None = field(default=None, init=False, repr=False)
     browser_tool_adapter: object | None = field(default=None, init=False, repr=False)
     browser_egress_proxy: object | None = field(default=None, init=False, repr=False)
+    s3_sync_service: object | None = field(default=None, init=False, repr=False)
+    s3_sync_configuration_status: str = field(default="disabled", init=False)
+    s3_sync_failure_code: str | None = field(default=None, init=False, repr=False)
     browser_integration_status: str = field(default="not_initialized", init=False)
     browser_integration_detail: str = field(default="", init=False, repr=False)
     browser_tools_registered: bool = field(default=False, init=False)
@@ -383,6 +386,10 @@ class TaskRuntime:
         try:
             self.wake_word_service.stop()
         finally:
+            sync_service = self.s3_sync_service
+            if sync_service is not None:
+                sync_service.stop()
+                self.s3_sync_service = None
             components = {
                 "session_manager": self.browser_session_manager,
                 "adapter": self.browser_tool_adapter,
@@ -396,6 +403,65 @@ class TaskRuntime:
 
     def startup(self) -> None:
         self.initialize_browser_integration()
+        self.initialize_s3_sync()
+
+    def initialize_s3_sync(self) -> None:
+        """Initialize opt-in S3 sync without making AWS a startup dependency."""
+        import os
+
+        if os.getenv("UNBOUND_S3_SYNC_ENABLED", "0") != "1":
+            self.s3_sync_configuration_status = "disabled"
+            return
+        if self.s3_sync_service is not None:
+            self.s3_sync_service.start()
+            return
+        try:
+            from backend.app.storage.s3_service import DEFAULT_BUCKET, DEFAULT_REGION, DEFAULT_PROFILE, S3DocumentService
+            from backend.app.storage.s3_sync import S3SyncService
+
+            repository_path = getattr(self.manager.repository, "database_path", None)
+            if repository_path is None:
+                raise ValueError("persistent task repository is required")
+            max_bytes = int(os.getenv("UNBOUND_S3_SYNC_MAX_BYTES", str(64 * 1024 * 1024)))
+            if not 1024 * 1024 <= max_bytes <= 512 * 1024 * 1024:
+                raise ValueError("sync size limit is out of range")
+            interval = int(os.getenv("UNBOUND_S3_SYNC_INTERVAL_SECONDS", "3600"))
+            storage = S3DocumentService(
+                bucket=os.getenv("UNBOUND_S3_BUCKET", DEFAULT_BUCKET),
+                region=os.getenv("UNBOUND_S3_REGION", DEFAULT_REGION),
+                profile=os.getenv("UNBOUND_S3_PROFILE", DEFAULT_PROFILE),
+                max_bytes=max_bytes,
+            )
+            self.s3_sync_service = S3SyncService(
+                task_database=repository_path,
+                document_store=self.document_store,
+                storage=storage,
+                enabled=True,
+                interval_seconds=interval,
+                retry_base_seconds=int(os.getenv("UNBOUND_S3_SYNC_RETRY_BASE_SECONDS", "30")),
+                retry_max_seconds=int(os.getenv("UNBOUND_S3_SYNC_RETRY_MAX_SECONDS", "3600")),
+            )
+            self.s3_sync_configuration_status = "enabled"
+            self.s3_sync_failure_code = None
+            self.s3_sync_service.start()
+        except Exception as exc:
+            self.s3_sync_service = None
+            self.s3_sync_configuration_status = "unavailable"
+            self.s3_sync_failure_code = type(exc).__name__
+
+    def s3_sync_status(self) -> dict[str, object]:
+        service = self.s3_sync_service
+        if service is None:
+            return {
+                "enabled": False,
+                "status": self.s3_sync_configuration_status,
+                "failure_code": self.s3_sync_failure_code,
+                "pending_count": 0,
+                "retry_count": 0,
+                "last_success_at": None,
+                "last_error_code": None,
+            }
+        return service.get_status()
 
     def get_reminder_draft(self, conversation_key: str) -> dict[str, object] | None:
         with self._reminder_drafts_lock:

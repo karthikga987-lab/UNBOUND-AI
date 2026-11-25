@@ -16,6 +16,7 @@ const AREA = {
   createConversation: 'conversations', getConversation: 'conversations', getConversationTaskReferences: 'conversations', deleteConversation: 'conversations',
   classifyAssistantRequest: 'assistant', assistantRequest: 'assistant', sendConversationMessage: 'conversations',
   createTask: 'tasks', listTasks: 'tasks', getTask: 'tasks', getTaskEvents: 'tasks', executeTask: 'tasks', cancelTask: 'tasks',
+  s3SyncStatus: 'storage', syncToS3: 'storage', listS3Backups: 'storage', restoreTaskBackup: 'storage',
   decideApproval: 'approvals',
   startRecording: 'workflows', stopRecording: 'workflows', listWorkflows: 'workflows', replayWorkflow: 'workflows',
   uploadDocument: 'documents', listDocuments: 'documents', searchDocuments: 'documents',

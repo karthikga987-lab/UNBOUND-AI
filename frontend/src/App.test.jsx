@@ -16,6 +16,10 @@ const state = vi.hoisted(() => ({
     listTasks: vi.fn(),
     executeTask: vi.fn(),
     cancelTask: vi.fn(),
+    s3SyncStatus: vi.fn(),
+    listS3Backups: vi.fn(),
+    syncToS3: vi.fn(),
+    restoreTaskBackup: vi.fn(),
   },
   onUtterance: null,
 }))
@@ -55,6 +59,8 @@ beforeEach(() => {
   state.api.getConversationTaskReferences.mockResolvedValue({ session_id: session.session_id, available_task_ids: [], unavailable_task_ids: [] })
   state.api.getTask.mockResolvedValue({ task_id: 'task-1', status: 'created', pending_approvals: [], plan: [] })
   state.api.listTasks.mockResolvedValue([])
+  state.api.s3SyncStatus.mockResolvedValue({ enabled: false, status: 'disabled', pending_count: 0, retry_count: 0 })
+  state.api.listS3Backups.mockResolvedValue([])
   state.api.decideApproval.mockResolvedValue({ task_id: 'task-1', status: 'created', pending_approvals: [], plan: [] })
   state.api.classifyAssistantRequest.mockResolvedValue({ category: 'information' })
   state.api.sendConversationMessage.mockResolvedValue({

@@ -76,6 +76,12 @@ export const realApi = {
   createTask: (userRequest, autoExecute = false) =>
     request('/tasks', { method: 'POST', body: { user_request: userRequest, auto_execute: autoExecute } }),
   listTasks: (limit = 100) => request(`/tasks?limit=${encodeURIComponent(limit)}`),
+  s3SyncStatus: () => request('/storage/s3/status'),
+  syncToS3: () => request('/storage/s3/sync', { method: 'POST', body: { confirm_sync: true } }),
+  listS3Backups: () => request('/storage/s3/backups'),
+  restoreTaskBackup: (objectKey) => request('/storage/s3/restore', {
+    method: 'POST', body: { object_key: objectKey, confirm_restore: true },
+  }),
   getTask: (taskId) => request(`/tasks/${taskId}`),
   getTaskEvents: (taskId) => request(`/tasks/${taskId}/events`),
   executeTask: (taskId) => request(`/tasks/${taskId}/execute`, { method: 'POST' }),

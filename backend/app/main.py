@@ -18,6 +18,7 @@ from backend.app.api.routes.memories import router as memories_router
 from backend.app.api.routes.reminders import router as reminders_router
 from backend.app.api.routes.tasks import router as tasks_router
 from backend.app.api.routes.wake_word import router as wake_word_router
+from backend.app.api.routes.storage import router as storage_router
 from backend.app.api.runtime import TaskRuntime
 from backend.app.orchestrator.task_manager import SQLiteTaskRepository, TaskManager
 
@@ -177,6 +178,7 @@ def create_app(runtime: TaskRuntime | None = None) -> FastAPI:
     )
     application.add_middleware(LocalPrototypeSecurityMiddleware)
     application.state.runtime = selected_runtime
+    application.state.allowed_browser_origins = ALLOWED_BROWSER_ORIGINS
     application.state.document_store = selected_runtime.document_store
     application.state.document_searcher = selected_runtime.document_searcher
     application.state.context_intelligence = selected_runtime.context_intelligence
@@ -188,6 +190,7 @@ def create_app(runtime: TaskRuntime | None = None) -> FastAPI:
     application.include_router(reminders_router, prefix="/api")
     application.include_router(tasks_router, prefix="/api")
     application.include_router(wake_word_router, prefix="/api")
+    application.include_router(storage_router, prefix="/api")
     application.include_router(
         build_document_router(
             selected_runtime.document_store,

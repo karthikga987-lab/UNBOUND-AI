@@ -79,6 +79,7 @@ def planned_runtime(*, verifier=lambda tool, expected, result: True, verified=Tr
 def test_application_starts_without_llm_credentials_and_health_is_honest(monkeypatch):
     monkeypatch.delenv("LLM_PROVIDER", raising=False)
     monkeypatch.delenv("LLM_MODEL", raising=False)
+    monkeypatch.setenv("UNBOUND_S3_SYNC_ENABLED", "0")
     client = TestClient(create_app())
     response = client.get("/api/health")
     assert response.status_code == 200
@@ -92,7 +93,51 @@ def test_application_starts_without_llm_credentials_and_health_is_honest(monkeyp
         "browser_public_execution_enabled": False,
         "browser_integration_status": "not_initialized",
         "browser_local_demo_enabled": False,
+        "browser_public_execution_status": "blocked_missing_process_containment",
+        "s3_sync": {
+            "enabled": False,
+            "status": "disabled",
+            "failure_code": None,
+            "pending_count": 0,
+            "retry_count": 0,
+            "last_success_at": None,
+            "last_error_code": None,
+        },
     }
+
+
+def test_s3_sync_routes_require_trusted_origin_confirmation_and_opt_in(monkeypatch):
+    monkeypatch.setenv("UNBOUND_S3_SYNC_ENABLED", "0")
+    client = TestClient(create_app())
+
+    status = client.get("/api/storage/s3/status")
+    assert status.status_code == 200
+    assert status.json()["status"] == "disabled"
+    assert client.get("/api/storage/s3/backups").json() == []
+
+    no_origin = client.post("/api/storage/s3/sync", json={"confirm_sync": True})
+    assert no_origin.status_code == 403
+    unconfirmed = client.post(
+        "/api/storage/s3/sync", json={"confirm_sync": False},
+        headers={"Origin": "http://127.0.0.1:5173"},
+    )
+    assert unconfirmed.status_code == 400
+    disabled = client.post(
+        "/api/storage/s3/sync", json={"confirm_sync": True},
+        headers={"Origin": "http://127.0.0.1:5173"},
+    )
+    assert disabled.status_code == 503
+
+
+def test_unavailable_s3_profile_does_not_prevent_application_startup(tmp_path, monkeypatch):
+    monkeypatch.setenv("UNBOUND_TASK_DB", str(tmp_path / "tasks.sqlite3"))
+    monkeypatch.setenv("UNBOUND_S3_SYNC_ENABLED", "1")
+    monkeypatch.setenv("UNBOUND_S3_PROFILE", "unbound-profile-that-does-not-exist")
+    with TestClient(create_app()) as client:
+        response = client.get("/api/health")
+        assert response.status_code == 200
+        assert response.json()["s3_sync"]["enabled"] is False
+        assert response.json()["s3_sync"]["status"] == "unavailable"
 
 
 def test_task_creation_retrieval_and_shared_runtime_state():
