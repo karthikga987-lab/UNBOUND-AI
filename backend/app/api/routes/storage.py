@@ -78,8 +78,9 @@ def restore_task_backup(body: RestoreRequest, request: Request) -> dict[str, obj
     service = runtime.s3_sync_service
     if service is None:
         raise HTTPException(status_code=503, detail={"code": "sync_unavailable", "message": "S3 storage is disabled or unavailable"})
+    sync_snapshot_prefix = f"{service.sync_prefix}/"
     if not body.object_key.startswith("unbound/backups/") and not re.fullmatch(
-        r"unbound/sync/snapshot-[a-f0-9]{64}\.zip", body.object_key
+        rf"{re.escape(sync_snapshot_prefix)}snapshot-[a-f0-9]{{64}}\.zip", body.object_key
     ):
         raise HTTPException(status_code=400, detail={"code": "invalid_backup_key", "message": "Object is not a supported task backup or application snapshot"})
     root = Path(service.state.path).parent / "recovery"
@@ -88,7 +89,7 @@ def restore_task_backup(body: RestoreRequest, request: Request) -> dict[str, obj
     if repository_path is None:
         raise HTTPException(status_code=503, detail={"code": "restore_unavailable", "message": "Active task database path is unavailable"})
     try:
-        if body.object_key.startswith("unbound/sync/"):
+        if body.object_key.startswith(sync_snapshot_prefix):
             destination = destination.with_suffix("")
             return service.restore_snapshot_to_new_directory(
                 body.object_key, destination, explicitly_approved=True,

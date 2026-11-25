@@ -14,6 +14,7 @@ from backend.app.llm.provider import LLMConfigurationError, LLMProviderError, LL
 from backend.app.main import create_app
 from backend.app.orchestrator.intent import TaskIntent
 from backend.app.orchestrator.planner import PlanDraft
+from backend.app.orchestrator.task_manager import SQLiteTaskRepository, TaskManager
 from backend.app.schemas.contracts import (
     ApprovalStatus,
     TaskCreateRequest,
@@ -127,6 +128,46 @@ def test_s3_sync_routes_require_trusted_origin_confirmation_and_opt_in(monkeypat
         headers={"Origin": "http://127.0.0.1:5173"},
     )
     assert disabled.status_code == 503
+
+
+def test_application_snapshot_restore_accepts_only_the_configured_sync_prefix(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("UNBOUND_TASK_DB", str(tmp_path / "tasks.sqlite3"))
+    monkeypatch.setenv("UNBOUND_S3_SYNC_ENABLED", "0")
+    runtime = TaskRuntime(manager=TaskManager(SQLiteTaskRepository(tmp_path / "tasks.sqlite3")))
+    app = create_app(runtime)
+    calls = []
+
+    class FakeSyncService:
+        sync_prefix = "unbound/phase5-verification"
+        state = SimpleNamespace(path=tmp_path / "sync-state.sqlite3")
+
+        def stop(self):
+            pass
+
+        def restore_snapshot_to_new_directory(self, key, destination, *, explicitly_approved):
+            calls.append((key, explicitly_approved))
+            return {"verified": True, "object_key": key, "destination": str(destination)}
+
+    runtime.s3_sync_service = FakeSyncService()
+    key = "unbound/phase5-verification/snapshot-" + ("a" * 64) + ".zip"
+    with TestClient(app) as client:
+        headers = {"Origin": "http://127.0.0.1:5173"}
+        rejected = client.post(
+            "/api/storage/s3/restore",
+            json={"object_key": "unbound/other/snapshot-" + ("a" * 64) + ".zip", "confirm_restore": True},
+            headers=headers,
+        )
+        assert rejected.status_code == 400
+        restored = client.post(
+            "/api/storage/s3/restore",
+            json={"object_key": key, "confirm_restore": True},
+            headers=headers,
+        )
+    assert restored.status_code == 200, restored.text
+    assert restored.json()["verified"] is True
+    assert calls == [(key, True)]
 
 
 def test_unavailable_s3_profile_does_not_prevent_application_startup(tmp_path, monkeypatch):
