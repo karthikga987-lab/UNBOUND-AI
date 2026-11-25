@@ -42,6 +42,44 @@ environment would leave its filtering and rollback behavior unverified, so no
 installer is supplied or run. Ordinary proxy settings and URL/DNS checks must
 not be described as process containment.
 
+## WFP design findings
+
+Microsoft's user-mode WFP management API exposes engine, provider, sublayer,
+filter, transaction, and deletion operations; basic application-specific ALE
+filters do not inherently require a custom kernel callout. The ALE outbound
+connect V4 and V6 layers expose the application ID, remote address, remote
+port, and protocol conditions needed for a scoped policy. The condition list
+for each filter is combined with AND semantics. WFP also evaluates all
+sub-layers, and a hard block overrides a permit, so a broad deny plus an
+overlapping proxy exception cannot be assumed to work. Any implementation
+needs explicit non-overlapping conditions, transactional install/rollback,
+and tests against the host's existing policy.
+
+The current proxy is not a distinct OS process: `TaskRuntime` constructs
+`LocalEgressProxy` in the FastAPI process. A policy that allowed the Python
+executable to make proxy egress would also grant that same executable's other
+code the same identity. This does not meet the requested proxy identity
+boundary. Before a policy can be designed for both processes, the proxy must
+be isolated into a dedicated executable or restricted service identity, or a
+separately reviewed enforcement mechanism must constrain its destinations.
+The default proxy port is ephemeral (`UNBOUND_BROWSER_EGRESS_PORT=0`); a
+fixed, reserved loopback port must be configured for any exact WFP exception.
+Runtime support for that setting is present, but no firewall policy currently
+uses it.
+
+WFP offers dynamic sessions whose objects are removed when their owning
+process exits, and persistent objects that remain until deleted. Dynamic
+cleanup alone would be unsafe here if the machine's effective outbound policy
+allows traffic after the session disappears. A production setup therefore
+needs a deliberately chosen persistent-policy lifecycle, atomic transactions,
+an exact rollback, and restart/crash tests. None of these installation or
+enforcement tests has been performed in this environment.
+
+References: [filtering conditions by layer](https://learn.microsoft.com/en-us/windows/win32/fwp/filtering-conditions-available-at-each-filtering-layer),
+[filter arbitration](https://learn.microsoft.com/en-us/windows/win32/fwp/filter-arbitration),
+[WFP object lifetime and transactions](https://learn.microsoft.com/en-us/windows/win32/fwp/object-management),
+and [user-mode WFP management functions](https://learn.microsoft.com/en-us/windows-hardware/drivers/network/wfp-user-mode-management-functions).
+
 ## Required administrator work before public browsing
 
 Use a separate elevated PowerShell session to design and validate an
