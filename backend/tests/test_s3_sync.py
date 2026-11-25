@@ -20,7 +20,7 @@ def make_db(path, table):
     return conn
 
 
-def setup_service(tmp_path, *, client=None, enabled=True, interval=3600):
+def setup_service(tmp_path, *, client=None, enabled=True, interval=3600, prefix="sync"):
     tasks_path = tmp_path / "tasks.sqlite3"
     task_db = make_db(tasks_path, "tasks")
     docs = DocumentStore(tmp_path / "documents")
@@ -38,6 +38,7 @@ def setup_service(tmp_path, *, client=None, enabled=True, interval=3600):
         interval_seconds=interval,
         retry_base_seconds=1,
         retry_max_seconds=4,
+        sync_prefix=prefix,
     )
     return service, task_db
 
@@ -120,6 +121,37 @@ def test_sync_disabled_by_default_and_does_not_attempt_upload(tmp_path):
             service.run_once(force=True)
         assert not client.calls
         assert service.get_status()["enabled"] is False
+    finally:
+        task_db.close()
+
+
+def test_sync_prefix_is_configurable_but_remains_under_unbound(tmp_path):
+    client = FakeS3()
+    service, task_db = setup_service(tmp_path, client=client, prefix="phase5-verification")
+    try:
+        result = service.run_once(force=True)
+        assert result["status"] == "synchronized"
+        assert result["prefix"] == "unbound/phase5-verification/"
+        assert result["last_object_key"].startswith("unbound/phase5-verification/snapshot-")
+    finally:
+        task_db.close()
+
+
+def test_sync_prefix_rejects_traversal(tmp_path):
+    service, task_db = setup_service(tmp_path)
+    try:
+        from backend.app.storage.s3_sync import S3SyncService
+        with pytest.raises(Exception) as exc:
+            S3SyncService(
+                task_database=service.task_database,
+                document_store=service.document_store,
+                storage=service.storage,
+                state_path=tmp_path / "bad-prefix-state.sqlite3",
+                enabled=True,
+                interval_seconds=3600,
+                sync_prefix="../escape",
+            )
+        assert getattr(exc.value, "code", None) == "invalid_object_key"
     finally:
         task_db.close()
 

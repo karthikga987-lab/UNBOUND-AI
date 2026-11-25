@@ -113,6 +113,7 @@ class S3SyncService:
         interval_seconds: int = 3600,
         retry_base_seconds: int = 30,
         retry_max_seconds: int = 3600,
+        sync_prefix: str = "sync",
     ) -> None:
         if not 60 <= interval_seconds <= 86400:
             raise ValueError("interval_seconds must be between 60 and 86400")
@@ -121,6 +122,8 @@ class S3SyncService:
         self.task_database = Path(task_database).expanduser().resolve()
         self.document_store = document_store
         self.storage = storage
+        normalized_prefix = sync_prefix.strip("/") if isinstance(sync_prefix, str) else ""
+        self.sync_prefix = self.storage.object_key(f"{normalized_prefix}/snapshot-probe.zip").rsplit("/", 1)[0]
         self.state = S3SyncStateStore(state_path or default_sync_state_path())
         self.enabled = enabled is True
         self.interval_seconds = interval_seconds
@@ -404,7 +407,7 @@ class S3SyncService:
             "interval_seconds": self.interval_seconds,
             "bucket": self.storage.bucket,
             "region": self.storage.region,
-            "prefix": "unbound/sync/",
+            "prefix": f"{self.sync_prefix}/",
         })
         return result
 
@@ -421,7 +424,8 @@ class S3SyncService:
                 try:
                     if now < datetime.fromisoformat(str(next_retry)):
                         return prior | {"enabled": self.enabled, "interval_seconds": self.interval_seconds,
-                                        "bucket": self.storage.bucket, "region": self.storage.region, "prefix": "unbound/sync/"}
+                                        "bucket": self.storage.bucket, "region": self.storage.region,
+                                        "prefix": f"{self.sync_prefix}/"}
                 except ValueError:
                     pass
             last_success = prior.get("last_success_at")
@@ -434,7 +438,7 @@ class S3SyncService:
             self.state.update(status="syncing", last_attempt_at=now.isoformat(), last_error_code=None)
             try:
                 payload, digest = self.create_snapshot()
-                key = f"sync/snapshot-{digest}.zip"
+                key = f"{self.sync_prefix}/snapshot-{digest}.zip"
                 try:
                     receipt = self.storage.upload_bytes(
                         key, payload, explicitly_approved=True,

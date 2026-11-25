@@ -440,6 +440,7 @@ class TaskRuntime:
                 interval_seconds=interval,
                 retry_base_seconds=int(os.getenv("UNBOUND_S3_SYNC_RETRY_BASE_SECONDS", "30")),
                 retry_max_seconds=int(os.getenv("UNBOUND_S3_SYNC_RETRY_MAX_SECONDS", "3600")),
+                sync_prefix=os.getenv("UNBOUND_S3_SYNC_PREFIX", "sync"),
             )
             self.s3_sync_configuration_status = "enabled"
             self.s3_sync_failure_code = None

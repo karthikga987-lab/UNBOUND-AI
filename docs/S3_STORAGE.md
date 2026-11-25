@@ -95,6 +95,7 @@ $env:UNBOUND_S3_BUCKET = "unbound-ai-documents-2026-karthik"
 $env:UNBOUND_S3_REGION = "ap-south-1"
 $env:UNBOUND_S3_PROFILE = "unbound-ai-local"
 $env:UNBOUND_S3_SYNC_INTERVAL_SECONDS = "3600" # allowed: 60..86400
+$env:UNBOUND_S3_SYNC_PREFIX = "sync" # S3 key prefix below unbound/; default preserves unbound/sync/
 $env:UNBOUND_S3_SYNC_MAX_BYTES = "67108864" # allowed: 1 MiB..512 MiB
 $env:UNBOUND_S3_SYNC_RETRY_BASE_SECONDS = "30"
 $env:UNBOUND_S3_SYNC_RETRY_MAX_SECONDS = "3600"

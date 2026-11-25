@@ -58,11 +58,12 @@ def list_backups(request: Request, limit: int = 100) -> list[dict[str, object]]:
         return []
     try:
         items = service.storage.list_objects(limit=max(1, min(limit, 1000)))
+        sync_snapshot_prefix = f"{service.sync_prefix}/snapshot-"
         return [
             {"key": item.key, "size_bytes": item.size_bytes,
              "last_modified": item.last_modified.isoformat() if item.last_modified else None,
              "kind": "task_database_backup" if item.key.startswith("unbound/backups/") else "application_snapshot"}
-            for item in items if item.key.startswith("unbound/backups/") or item.key.startswith("unbound/sync/snapshot-")
+            for item in items if item.key.startswith("unbound/backups/") or item.key.startswith(sync_snapshot_prefix)
         ][:limit]
     except S3StorageError as exc:
         raise HTTPException(status_code=503, detail={"code": exc.code, "message": str(exc)}) from exc
