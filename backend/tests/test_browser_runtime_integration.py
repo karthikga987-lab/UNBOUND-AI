@@ -191,6 +191,31 @@ def test_proxy_startup_failure_keeps_browser_actions_disabled(tmp_path, monkeypa
         } <= names
 
 
+def test_protected_mode_never_falls_back_to_user_writable_proxy_or_browser_cache(monkeypatch):
+    import backend.app.browser.protected_deployment as protected_deployment
+
+    _set_valid_key(monkeypatch)
+    monkeypatch.setenv("UNBOUND_BROWSER_PROTECTED_MODE", "1")
+    monkeypatch.setenv("UNBOUND_BROWSER_LOCAL_DEMO", "1")
+
+    def unavailable():
+        raise protected_deployment.ProtectedDeploymentError("synthetic missing deployment")
+
+    monkeypatch.setattr(protected_deployment, "verify_protected_deployment", unavailable)
+    runtime = TaskRuntime()
+    with TestClient(create_app(runtime)) as client:
+        status = client.get("/api/health").json()
+        assert runtime.browser_deployment_mode == "protected"
+        assert runtime.browser_protected_deployment_verified is False
+        assert runtime.browser_deployment_acl_verified is False
+        assert runtime.browser_deployment_failure_code == "protected_deployment_unverified"
+        assert runtime.browser_egress_proxy is None
+        assert runtime.browser_integration_status == "disabled_protected_deployment_unverified"
+        assert status["browser_protected_deployment_verified"] is False
+        assert status["browser_public_execution_enabled"] is False
+        assert runtime.browser_egress_security_enabled is False
+
+
 def test_registered_browser_navigation_gate_never_reaches_controller(tmp_path, monkeypatch):
     _set_valid_key(monkeypatch)
     runtime = TaskRuntime()

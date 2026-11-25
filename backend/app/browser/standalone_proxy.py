@@ -20,6 +20,13 @@ _SHUTDOWN_TIMEOUT_SECONDS = 5.0
 
 
 def default_proxy_executable() -> Path:
+    from backend.app.browser.protected_deployment import (
+        protected_mode_requested,
+        verify_protected_deployment,
+    )
+
+    if protected_mode_requested():
+        return verify_protected_deployment().proxy_executable
     return Path(__file__).resolve().parent / "bin" / "unbound-egress-proxy" / "unbound-egress-proxy.exe"
 
 
@@ -100,10 +107,20 @@ class StandaloneEgressProxy:
         self.port = port
         self.demo_only = bool(demo_only)
         self.max_body_bytes = max_body_bytes
-        self.executable_path = (executable or default_proxy_executable()).resolve()
-        self._expected_root = default_proxy_executable().parent.resolve()
-        if executable is None and self.executable_path.parent != self._expected_root:
-            raise StandaloneProxyError("Proxy executable is outside the managed application directory")
+        selected_executable = executable if executable is not None else default_proxy_executable()
+        self.executable_path = selected_executable.resolve()
+        from backend.app.browser.protected_deployment import (
+            protected_mode_requested,
+            verify_protected_deployment,
+        )
+
+        if protected_mode_requested():
+            deployment = verify_protected_deployment()
+            if self.executable_path != deployment.proxy_executable:
+                raise StandaloneProxyError(
+                    "Protected mode requires the verified deployed proxy executable"
+                )
+        self._expected_root = self.executable_path.parent.resolve()
         self._secret = __import__("secrets").token_urlsafe(32)
         self._process: subprocess.Popen[str] | None = None
         self._image_lock: _ExecutableLock | None = None

@@ -46,7 +46,17 @@ def _load_playwright():
     # tests (and isolated per-user app data) can still find the installed
     # Chromium. Respect an explicit setting; only select the project cache
     # when it exists and no path was configured.
-    if not os.getenv("PLAYWRIGHT_BROWSERS_PATH"):
+    from backend.app.browser.protected_deployment import (
+        protected_mode_requested,
+        verify_protected_deployment,
+    )
+
+    if protected_mode_requested():
+        # Protected mode verifies a fixed Program Files deployment and never
+        # trusts a caller-supplied cache path or falls back to the repo cache.
+        deployment = verify_protected_deployment()
+        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(deployment.playwright_browsers_path)
+    elif not os.getenv("PLAYWRIGHT_BROWSERS_PATH"):
         project_cache = Path(__file__).resolve().parents[3] / ".playwright-browsers"
         if project_cache.is_dir():
             os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(project_cache)

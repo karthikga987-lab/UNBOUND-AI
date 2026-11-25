@@ -119,6 +119,74 @@ The process separation and fixed endpoint blockers are resolved in application
 code, but no WFP policy currently uses the endpoint. Process-level egress
 containment remains unimplemented and unverified.
 
+## Protected browser deployment (Phase 10)
+
+The repository now includes staged deployment tooling for a protected
+installation at `C:\Program Files\UNBOUND AI`. It copies the complete
+PyInstaller one-directory proxy package and the complete installed Playwright
+Chromium revision directory (not only `chrome.exe`), hashes every file, writes
+a deployment manifest, applies protected ACLs to each deployed file and
+directory, and verifies the staged deployment before publishing it. Ordinary
+Users receive read/execute only; Administrators and SYSTEM retain full
+control. The verifier rejects unexpected files, reparse points, changed
+hashes, non-protected ACLs, explicit deny rules, and paths outside the fixed
+Program Files root. Administrators and SYSTEM remain trusted and can modify
+the deployment. This does not defend against a malicious administrator or
+compromise of the build toolchain.
+
+Deployment has **not** been run in this environment: the active Codex process
+is not elevated. No protected files or ACLs have been created or changed. The
+runtime supports explicit `UNBOUND_BROWSER_PROTECTED_MODE=1`; in that mode it
+verifies the manifest, complete file inventory, executable hashes, and ACLs
+before using the deployed proxy and setting `PLAYWRIGHT_BROWSERS_PATH`. Any
+failure disables browser integration without falling back to checkout or
+user-writable binaries. Development mode remains the default and is reported
+separately. Neither mode changes the public browsing gate.
+
+After review, an administrator may deploy and verify the binaries with:
+
+```powershell
+Set-Location 'C:\Users\KARTHIK G A\UNBOUND-AI'
+.\scripts\browser-security\deploy-protected-browser.ps1
+.\scripts\browser-security\verify-protected-browser.ps1
+```
+
+Set `UNBOUND_BROWSER_PROTECTED_MODE=1` for the backend only after the verifier
+reports success. The deployment is removed only by the ownership- and
+manifest-checking script, with the deployment ID confirmed from verification:
+
+```powershell
+.\scripts\browser-security\remove-protected-browser.ps1 -ExpectedDeploymentId '<verified-deployment-id>'
+```
+
+These deployment scripts are not WFP setup scripts and do not establish
+network containment.
+
+## Phase 10 WFP implementation status
+
+No WFP provider, sublayer, filter, or install/remove tool has been created.
+No Windows policy was installed. The active Codex process is not elevated, and
+the available environment has neither a .NET SDK nor the Windows SDK C++
+compiler. More importantly, the current proxy resolves names through the
+Windows resolver; an application-ID ALE rule for the proxy does not by itself
+constrain DNS Client service traffic to that proxy identity. A correct policy
+therefore needs a separately designed/controlled resolver path (or another
+verified DNS mediation mechanism) in addition to app-ID filters. Implementing
+and publishing an untested filter set from this process would risk claiming a
+false boundary or interfering with unrelated networking. No WFP commands
+should be run and public browsing must remain disabled until that design is
+implemented and reviewed, then installed and independently tested.
+
+For eventual WFP tooling, the design must bind to the protected executable
+identities, use transactional ownership-scoped objects, and avoid relying on
+an overlapping allow overriding a hard block. At ALE connect layers, filter
+conditions are ANDed and hard blocks can win across sublayers. The Chromium
+policy must permit only TCP to `127.0.0.1:18765` and block every other IPv4
+tuple plus all IPv6 egress; the proxy policy must separately constrain TCP
+ports and non-global destinations while handling DNS through an identity-bound
+resolver design. These are requirements, not installed filters or verified
+behavior.
+
 WFP offers dynamic sessions whose objects are removed when their owning
 process exits, and persistent objects that remain until deleted. Dynamic
 cleanup alone would be unsafe here if the machine's effective outbound policy

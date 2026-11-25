@@ -81,6 +81,11 @@ class TaskRuntime:
     s3_sync_failure_code: str | None = field(default=None, init=False, repr=False)
     browser_integration_status: str = field(default="not_initialized", init=False)
     browser_integration_detail: str = field(default="", init=False, repr=False)
+    browser_deployment_mode: str = field(default="development", init=False)
+    browser_protected_deployment_verified: bool = field(default=False, init=False)
+    browser_deployment_acl_verified: bool = field(default=False, init=False)
+    browser_deployment_failure_code: str | None = field(default=None, init=False)
+    browser_deployment_root: str | None = field(default=None, init=False)
     browser_tools_registered: bool = field(default=False, init=False)
     browser_egress_security_enabled: bool = field(default=False, init=False)
     user_timezone: str = field(default_factory=lambda: os.getenv("UNBOUND_TIMEZONE", "UTC"))
@@ -220,19 +225,50 @@ class TaskRuntime:
         import os
         from backend.app.browser.controller import BrowserController
         from backend.app.browser.standalone_proxy import StandaloneEgressProxy
+        from backend.app.browser.protected_deployment import (
+            ProtectedDeploymentError,
+            protected_mode_requested,
+            verify_protected_deployment,
+        )
         from backend.app.browser.session_manager import BrowserSessionManager
         from backend.app.browser.tools import BrowserToolAdapter
         from backend.app.browser.workflow_store import WorkflowStore
 
         local_demo = os.getenv("UNBOUND_BROWSER_LOCAL_DEMO") == "1"
+        protected_mode = protected_mode_requested()
+        deployment = None
+        deployment_failure = None
+        self.browser_deployment_mode = "protected" if protected_mode else "development"
+        self.browser_protected_deployment_verified = False
+        self.browser_deployment_acl_verified = False
+        self.browser_deployment_root = None
+        self.browser_deployment_failure_code = None
+        if protected_mode:
+            try:
+                deployment = verify_protected_deployment()
+                # Playwright resolves its browser executable from this cache.
+                # Protected mode has no fallback to the checkout cache.
+                os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(deployment.playwright_browsers_path)
+                self.browser_protected_deployment_verified = True
+                self.browser_deployment_acl_verified = True
+                self.browser_deployment_root = str(deployment.root)
+            except ProtectedDeploymentError:
+                deployment_failure = "protected_deployment_unverified"
+                self.browser_deployment_failure_code = deployment_failure
         workflow_store = WorkflowStore(os.getenv("UNBOUND_BROWSER_WORKFLOW_DIR") or None)
         # Fixed port is required for an exact process-level proxy exception.
         # A collision fails closed; the runtime never silently picks another.
         egress_proxy = None
-        egress_proxy_error = False
+        egress_proxy_error = deployment_failure is not None
         try:
+            if egress_proxy_error:
+                raise RuntimeError("protected deployment verification failed")
             proxy_port = int(os.getenv("UNBOUND_BROWSER_EGRESS_PORT", "18765"))
-            egress_proxy = StandaloneEgressProxy(demo_only=local_demo, port=proxy_port)
+            egress_proxy = StandaloneEgressProxy(
+                demo_only=local_demo,
+                port=proxy_port,
+                executable=deployment.proxy_executable if deployment is not None else None,
+            )
             egress_proxy.start()
         except (OSError, RuntimeError, ValueError):
             # Keep the API and its disabled tool registrations available; a
@@ -256,8 +292,12 @@ class TaskRuntime:
         }
         key_setting = os.getenv("BROWSER_REPLAY_STATE_KEY")
         if egress_proxy_error:
-            status = "disabled_egress_proxy_unavailable"
-            detail = "The standalone egress proxy could not be started on its configured loopback port; browser actions are disabled."
+            status = "disabled_protected_deployment_unverified" if deployment_failure else "disabled_egress_proxy_unavailable"
+            detail = (
+                "Protected browser binaries or their ACLs could not be verified; user-writable browser binaries are not used."
+                if deployment_failure else
+                "The standalone egress proxy could not be started on its configured loopback port; browser actions are disabled."
+            )
         elif not key_setting:
             status = "disabled_missing_replay_key"
             detail = "Replay-state encryption is not configured; browser actions are disabled."
