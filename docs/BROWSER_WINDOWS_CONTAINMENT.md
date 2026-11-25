@@ -8,9 +8,11 @@ containment field remains `false`. A healthy proxy is not evidence that
 Chromium cannot connect directly.
 
 The browser runtime uses a loopback egress proxy with per-runtime credentials.
-The proxy validates complete DNS answers, rejects non-public destinations,
-connects to the validated numeric address, restricts public ports to HTTP 80
-and HTTPS 443, and validates each new connection. Chromium is configured to
+The proxy resolves DNS over TLS using an explicitly configured numeric
+resolver address and TLS server hostname, validates complete A and AAAA
+answers, rejects non-public destinations, connects to the validated numeric
+address, restricts public ports to HTTP 80 and HTTPS 443, and validates each
+new connection. Chromium is configured to
 use that proxy, disables QUIC and non-proxied WebRTC UDP, blocks service
 workers, and applies request-scheme checks. These are application controls;
 they do not establish a Windows process-level network boundary.
@@ -91,7 +93,8 @@ that runtime. It is not a code signature, does not attest build provenance,
 and does not protect a writable package directory against replacement before
 startup. Deployments must protect the project-controlled directory with
 suitable filesystem ACLs and build from the pinned
-`requirements-browser-proxy-build.txt` dependency.
+`requirements-browser-proxy-build.txt` build inputs (PyInstaller is pinned;
+dnspython is constrained to `>=2.7,<3`).
 
 Build the executable from project-owned source with:
 
@@ -162,20 +165,52 @@ manifest-checking script, with the deployment ID confirmed from verification:
 These deployment scripts are not WFP setup scripts and do not establish
 network containment.
 
+### Explicit DNS-over-TLS configuration
+
+Non-demo proxy startup requires all three settings below. There is no default
+resolver provider or hostname; the operator must choose a resolver and use
+the numeric IP and TLS hostname documented by that resolver. The IP must be a
+globally routable literal address, the TLS hostname must be a valid DNS name,
+and the timeout must be between 0.1 and 30 seconds.
+
+```powershell
+$env:UNBOUND_DOT_RESOLVER_IP = '<resolver numeric IP>'
+$env:UNBOUND_DOT_TLS_SERVER_NAME = '<resolver TLS certificate hostname>'
+$env:UNBOUND_DOT_TIMEOUT_SECONDS = '3'
+```
+
+The proxy connects to that literal IP on TCP/853 and passes the configured
+hostname and a default trusted CA context to dnspython's `dns.query.tls`.
+Certificate verification and hostname checking remain enabled. Each lookup
+requests A and AAAA; malformed, truncated, non-success, timed-out, or wholly
+empty responses fail closed. All addresses are then checked together by the
+existing public-address policy before the proxy connects to a pinned numeric
+destination. The proxy does not fall back to Windows `getaddrinfo` or another
+system resolver. Local Demo does not instantiate or call DNS and remains
+offline.
+
+The existing ignored PyInstaller proxy package predates the new startup
+protocol. A non-demo start requires the rebuilt child to report
+`dns_mode=dot`; an old binary is rejected and fails closed. The repository
+build script refuses to overwrite an existing proxy package, so this change
+does not replace that artifact. Rebuilding/replacing the package and checking
+its runtime identity must be done as a separately reviewed deployment step.
+
 ## Phase 10 WFP implementation status
 
 No WFP provider, sublayer, filter, or install/remove tool has been created.
 No Windows policy was installed. The active Codex process is not elevated, and
 the available environment has neither a .NET SDK nor the Windows SDK C++
-compiler. More importantly, the current proxy resolves names through the
-Windows resolver; an application-ID ALE rule for the proxy does not by itself
-constrain DNS Client service traffic to that proxy identity. A correct policy
-therefore needs a separately designed/controlled resolver path (or another
-verified DNS mediation mechanism) in addition to app-ID filters. Implementing
-and publishing an untested filter set from this process would risk claiming a
-false boundary or interfering with unrelated networking. No WFP commands
-should be run and public browsing must remain disabled until that design is
-implemented and reviewed, then installed and independently tested.
+compiler. The source proxy now uses explicit DNS-over-TLS to a numeric
+resolver endpoint, removing its previous dependency on the Windows resolver.
+That narrows the WFP design requirement to permitting the exact proxy
+application to the selected resolver IP on TCP/853, alongside its validated
+HTTP/HTTPS destinations, while blocking other proxy DNS traffic. This has not
+been encoded in or validated as WFP filters. Implementing and publishing an
+untested filter set from this process would risk claiming a false boundary or
+interfering with unrelated networking. Public browsing remains disabled
+until policy design, installation, arbitration and independent enforcement
+tests are complete.
 
 For eventual WFP tooling, the design must bind to the protected executable
 identities, use transactional ownership-scoped objects, and avoid relying on
@@ -183,9 +218,9 @@ an overlapping allow overriding a hard block. At ALE connect layers, filter
 conditions are ANDed and hard blocks can win across sublayers. The Chromium
 policy must permit only TCP to `127.0.0.1:18765` and block every other IPv4
 tuple plus all IPv6 egress; the proxy policy must separately constrain TCP
-ports and non-global destinations while handling DNS through an identity-bound
-resolver design. These are requirements, not installed filters or verified
-behavior.
+ports 80/443 to validated non-global-rejected destinations, plus TCP/853 to
+the configured numeric DoT resolver only. These are requirements, not
+installed filters or verified behavior.
 
 WFP offers dynamic sessions whose objects are removed when their owning
 process exits, and persistent objects that remain until deleted. Dynamic

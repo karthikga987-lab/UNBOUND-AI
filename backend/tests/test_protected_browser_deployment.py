@@ -54,6 +54,8 @@ def test_protected_manifest_validates_full_file_inventory_and_executable_hashes(
     assert verified.deployment_id == manifest["deployment_id"]
     assert verified.proxy_executable == root / "browser" / "proxy" / "unbound-egress-proxy.exe"
     assert verified.chromium_executable == root / "playwright-browsers" / "chromium-1255" / "chrome-win64" / "chrome.exe"
+    assert isinstance(verified.chromium_sha256, str)
+    assert verified.chromium_sha256 == manifest["chromium_sha256"]
     assert verified.playwright_browsers_path == root / "playwright-browsers"
     assert acl_roots == [root]
 
@@ -94,3 +96,46 @@ def test_protected_manifest_rejects_path_traversal_and_missing_files(tmp_path, m
     (root / manifest["chromium_path"]).unlink()
     with pytest.raises(deployment.ProtectedDeploymentError, match="file verification failed"):
         deployment._verify_root(str(root))
+
+
+@pytest.mark.parametrize(
+    "unsafe_path",
+    [
+        "../outside.exe",
+        "browser//proxy.exe",
+        "browser/./proxy.exe",
+        "C:/outside.exe",
+        "//server/share.exe",
+        "browser/proxy.exe:stream",
+        "browser/CON.txt",
+        "browser/trailing./proxy.exe",
+        "browser/trailing /proxy.exe",
+        "browser\\proxy.exe",
+    ],
+)
+def test_manifest_paths_must_be_canonical_windows_safe_relative_paths(tmp_path, monkeypatch, unsafe_path):
+    program_files = tmp_path / "Program Files"
+    root = program_files / "UNBOUND AI"
+    root.mkdir(parents=True)
+    manifest = _manifest(root)
+    manifest["files"][0]["path"] = unsafe_path
+    (root / "deployment.json").write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setenv("ProgramFiles", str(program_files))
+    monkeypatch.setattr(deployment, "_verify_acl", lambda _candidate: None)
+    with pytest.raises(deployment.ProtectedDeploymentError, match="unsafe path"):
+        deployment._verify_root(str(root))
+
+
+def test_acl_verification_requires_both_privileged_full_control_groups():
+    valid = {
+        "verified": True,
+        "administrators_full_control": True,
+        "system_full_control": True,
+        "users_read_execute_only": True,
+    }
+    assert deployment._acl_report_is_valid(valid)
+    missing_administrators = {**valid, "administrators_full_control": False}
+    missing_system = {**valid, "system_full_control": False}
+    assert not deployment._acl_report_is_valid(missing_administrators)
+    assert not deployment._acl_report_is_valid(missing_system)
+    assert not deployment._acl_report_is_valid({**valid, "extra": True})

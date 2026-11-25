@@ -34,6 +34,7 @@ Push-Location $repoRoot
 try {
     & $pythonPath -m PyInstaller --noconfirm --clean --onedir --console `
         --name unbound-egress-proxy `
+        --collect-submodules dns `
         --distpath $distDirectory `
         --workpath $workDirectory `
         --specpath $specDirectory `

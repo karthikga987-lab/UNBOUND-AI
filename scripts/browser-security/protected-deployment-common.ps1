@@ -33,6 +33,39 @@ function Get-UnboundInventory([string]$Root) {
     )
 }
 
+function Assert-UnboundNoReparsePoint([string]$Path) {
+    $rootItem = Get-Item -LiteralPath $Path -Force
+    if ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        throw 'Source contains a reparse point.'
+    }
+    if (-not $rootItem.PSIsContainer) { return }
+    $pending = [Collections.Generic.Stack[string]]::new()
+    $pending.Push($rootItem.FullName)
+    while ($pending.Count -gt 0) {
+        $current = $pending.Pop()
+        foreach ($child in Get-ChildItem -LiteralPath $current -Force) {
+            if ($child.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                throw 'Source contains a reparse point.'
+            }
+            if ($child.PSIsContainer) { $pending.Push($child.FullName) }
+        }
+    }
+}
+
+function Remove-UnboundFailedPublication([string]$Root, [string]$DeploymentId) {
+    $expectedRoot = [IO.Path]::GetFullPath($script:UnboundDeploymentRoot).TrimEnd('\')
+    $actualRoot = [IO.Path]::GetFullPath($Root).TrimEnd('\')
+    if ($actualRoot -ne $expectedRoot) { return $false }
+    $manifestPath = Join-Path $actualRoot $script:UnboundManifestName
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { return $false }
+    $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    if ($manifest.application -ne 'UNBOUND-AI' -or [string]$manifest.deployment_id -ne $DeploymentId) { return $false }
+    # Called only after this invocation published a previously absent root.
+    Remove-Item -LiteralPath $actualRoot -Recurse -Force
+    if (Test-Path -LiteralPath $actualRoot) { throw 'Rollback did not remove the failed deployment.' }
+    return $true
+}
+
 function Set-UnboundProtectedAcl([string]$Root) {
     $admins = [Security.Principal.SecurityIdentifier]::new($script:UnboundAdminSid)
     $system = [Security.Principal.SecurityIdentifier]::new($script:UnboundSystemSid)
@@ -78,8 +111,8 @@ function Test-UnboundProtectedAcl([string]$Root) {
             $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and
             $_.IdentityReference.Value -in $requiredPrivileged -and
             (($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -eq [Security.AccessControl.FileSystemRights]::FullControl)
-        })
-        if ($privilegedFull.Count -lt 2) { return $false }
+        } | ForEach-Object { $_.IdentityReference.Value } | Select-Object -Unique)
+        if ($privilegedFull.Count -ne 2) { return $false }
         $writeMask = [Security.AccessControl.FileSystemRights]::Write -bor [Security.AccessControl.FileSystemRights]::Modify -bor [Security.AccessControl.FileSystemRights]::Delete -bor [Security.AccessControl.FileSystemRights]::ChangePermissions -bor [Security.AccessControl.FileSystemRights]::TakeOwnership
         if (@($rules | Where-Object {
             $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and
@@ -118,8 +151,24 @@ function Test-UnboundDeployment([string]$Root, [switch]$CheckAcl, [switch]$Allow
     }
     foreach ($entry in $manifest.files) {
         $relative = [string]$entry.path
-        if ([IO.Path]::IsPathRooted($relative) -or $relative.Contains('..') -or $relative.Contains(':')) { throw 'Manifest contains an unsafe relative path.' }
+        $segments = $relative.Split('/')
+        if (
+            [IO.Path]::IsPathRooted($relative) -or
+            $relative -match '[\\:*?"<>|]' -or
+            $relative.Contains(':') -or
+            (@($segments | Where-Object { $_ -in @('', '.', '..') -or $_.EndsWith('.') -or $_.EndsWith(' ') -or $_ -match '^(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?$' }).Count -gt 0)
+        ) { throw 'Manifest contains an unsafe relative path.' }
         $path = Join-Path $actualRoot ($relative.Replace('/', '\'))
+        $canonicalPath = [IO.Path]::GetFullPath($path)
+        if (-not $canonicalPath.StartsWith($actualRoot.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Manifest path escapes the deployment root.' }
+        $canonicalRelative = $canonicalPath.Substring($actualRoot.TrimEnd('\').Length + 1).Replace('\', '/')
+        if (-not [string]::Equals($relative, $canonicalRelative, [StringComparison]::Ordinal)) { throw 'Manifest path is not canonical.' }
+        $walk = $actualRoot
+        foreach ($segment in $segments) {
+            $walk = Join-Path $walk $segment
+            $component = Get-Item -LiteralPath $walk -Force -ErrorAction SilentlyContinue
+            if ($null -ne $component -and ($component.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Manifest path contains a reparse point.' }
+        }
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Protected deployment file is missing: $relative" }
         if ((Get-UnboundFileHash $path) -ne ([string]$entry.sha256).ToLowerInvariant()) { throw "Protected deployment hash mismatch: $relative" }
     }

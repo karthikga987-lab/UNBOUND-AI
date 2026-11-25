@@ -5,7 +5,7 @@ from io import BytesIO
 
 import pytest
 
-from backend.app.storage.s3_service import S3DocumentService, S3StorageError
+from backend.app.storage.s3_service import DEFAULT_PROFILE, DEFAULT_REGION, S3DocumentService, S3StorageError
 
 
 class FakeS3:
@@ -40,6 +40,17 @@ class FakeS3:
     def get_object(self, *, Bucket, Key):
         data, _ = self.objects[(Bucket, Key)]
         return {"Body": BytesIO(data)}
+
+
+def test_default_region_and_profile_and_explicit_region_override():
+    default_service = S3DocumentService(client=FakeS3())
+    assert DEFAULT_REGION == "ap-southeast-2"
+    assert default_service.region == "ap-southeast-2"
+    assert default_service.profile == "unbound-ai-local"
+
+    override_service = S3DocumentService(client=FakeS3(), region="eu-west-1")
+    assert override_service.region == "eu-west-1"
+    assert override_service.profile == "unbound-ai-local"
 
 
 def test_upload_requires_explicit_confirmation_and_verifies_head_metadata():

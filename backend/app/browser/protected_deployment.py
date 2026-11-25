@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import subprocess
 
@@ -43,10 +43,12 @@ foreach ($item in $paths) {
   $rules = @($acl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))
   if (@($rules | Where-Object { $_.IdentityReference.Value -notin $allowed }).Count -gt 0) { throw 'unexpected_acl_principal' }
   if (@($rules | Where-Object { $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Deny }).Count -gt 0) { throw 'deny_acl_rule' }
+  $privilegedFull = @($rules | Where-Object { $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and $_.IdentityReference.Value -in $privileged -and (($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -eq [Security.AccessControl.FileSystemRights]::FullControl) })
+  if (@($privilegedFull | ForEach-Object { $_.IdentityReference.Value } | Select-Object -Unique).Count -ne 2) { throw 'privileged_full_control_missing' }
   if (@($rules | Where-Object { $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and $_.IdentityReference.Value -eq 'S-1-5-32-545' -and (($_.FileSystemRights -band $writeMask) -ne 0) }).Count -gt 0) { throw 'users_can_write' }
   if (@($rules | Where-Object { $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and $_.IdentityReference.Value -eq 'S-1-5-32-545' -and (($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]::ReadAndExecute) -eq [Security.AccessControl.FileSystemRights]::ReadAndExecute) }).Count -eq 0) { throw 'users_lack_read_execute' }
 }
-@{ verified = $true } | ConvertTo-Json -Compress
+@{ verified = $true; administrators_full_control = $true; system_full_control = $true; users_read_execute_only = $true } | ConvertTo-Json -Compress
 """
 
 
@@ -64,7 +66,23 @@ def _sha256(path: Path) -> str:
 
 def _under_root(root: Path, relative: str) -> Path:
     candidate = PurePosixPath(relative)
-    if candidate.is_absolute() or ".." in candidate.parts or "\\" in relative or ":" in relative:
+    windows_candidate = PureWindowsPath(relative)
+    segments = relative.split("/")
+    invalid_windows_segment = any(
+        not segment
+        or segment in {".", ".."}
+        or segment.endswith((".", " "))
+        or any(ord(character) < 32 or character in '<>:"\\|?*' for character in segment)
+        or re.match(r"(?i)^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?$", segment)
+        for segment in segments
+    )
+    if (
+        candidate.is_absolute()
+        or windows_candidate.is_absolute()
+        or windows_candidate.drive
+        or candidate.as_posix() != relative
+        or invalid_windows_segment
+    ):
         raise ProtectedDeploymentError("Protected deployment manifest contains an unsafe path")
     lexical = root / Path(*candidate.parts)
     if lexical.is_symlink() or getattr(lexical, "is_junction", lambda: False)():
@@ -108,8 +126,18 @@ def _verify_acl(root: Path) -> None:
         response = json.loads(result.stdout.strip()) if result.stdout.strip() else {}
     except Exception:
         raise ProtectedDeploymentError("Protected deployment ACL verification failed") from None
-    if result.returncode != 0 or response != {"verified": True}:
+    if result.returncode != 0 or not _acl_report_is_valid(response):
         raise ProtectedDeploymentError("Protected deployment ACL verification failed")
+
+
+def _acl_report_is_valid(response: object) -> bool:
+    expected = {
+        "verified",
+        "administrators_full_control",
+        "system_full_control",
+        "users_read_execute_only",
+    }
+    return isinstance(response, dict) and set(response) == expected and all(response.get(key) is True for key in expected)
 
 
 def _verify_root(root_text: str) -> ProtectedBrowserDeployment:
@@ -137,18 +165,18 @@ def _verify_root(root_text: str) -> ProtectedBrowserDeployment:
         or not isinstance(manifest.get("files"), list)
     ):
         raise ProtectedDeploymentError("Protected browser deployment manifest is invalid")
-    inventory: dict[str, str] = {}
+    inventory: dict[str, tuple[str, str]] = {}
     for entry in manifest["files"]:
         if not isinstance(entry, dict) or not isinstance(entry.get("path"), str) or not isinstance(entry.get("sha256"), str):
             raise ProtectedDeploymentError("Protected browser deployment inventory is invalid")
         name = entry["path"]
         digest = entry["sha256"].lower()
-        if name != name.lower() or not re.fullmatch(r"[0-9a-f]{64}", digest) or name in inventory:
+        if not re.fullmatch(r"[0-9a-f]{64}", digest) or name.casefold() in inventory:
             raise ProtectedDeploymentError("Protected browser deployment inventory is invalid")
         path = _under_root(root, name)
         if path.is_symlink() or not path.is_file() or _sha256(path) != digest:
             raise ProtectedDeploymentError("Protected browser deployment file verification failed")
-        inventory[name] = digest
+        inventory[name.casefold()] = (name, digest)
     actual: set[str] = set()
     for base, dirs, files in os.walk(root, followlinks=False):
         for directory in dirs:
@@ -160,17 +188,28 @@ def _verify_root(root_text: str) -> ProtectedBrowserDeployment:
             if path == manifest_path:
                 continue
             actual.add(path.relative_to(root).as_posix())
-    if actual != set(inventory):
+    actual_folded: dict[str, str] = {}
+    for name in actual:
+        folded = name.casefold()
+        if folded in actual_folded:
+            raise ProtectedDeploymentError("Protected browser deployment contains case-colliding paths")
+        actual_folded[folded] = name
+    if set(actual_folded) != set(inventory):
         raise ProtectedDeploymentError("Protected browser deployment has an unexpected or missing file")
     proxy_name = manifest.get("proxy_path")
     chromium_name = manifest.get("chromium_path")
-    if proxy_name not in inventory or chromium_name not in inventory:
+    if not isinstance(proxy_name, str) or not isinstance(chromium_name, str) or proxy_name.casefold() not in inventory or chromium_name.casefold() not in inventory:
         raise ProtectedDeploymentError("Protected browser executable paths are not inventoried")
     proxy = _under_root(root, proxy_name)
     chromium = _under_root(root, chromium_name)
     if proxy.name.lower() != "unbound-egress-proxy.exe" or chromium.name.lower() != "chrome.exe":
         raise ProtectedDeploymentError("Protected browser executable names are invalid")
-    if _sha256(proxy) != manifest.get("proxy_sha256") or _sha256(chromium) != manifest.get("chromium_sha256"):
+    if (
+        _sha256(proxy) != manifest.get("proxy_sha256")
+        or _sha256(chromium) != manifest.get("chromium_sha256")
+        or inventory[proxy_name.casefold()][1] != manifest.get("proxy_sha256")
+        or inventory[chromium_name.casefold()][1] != manifest.get("chromium_sha256")
+    ):
         raise ProtectedDeploymentError("Protected browser executable hash verification failed")
     _verify_acl(root)
     return ProtectedBrowserDeployment(
@@ -178,9 +217,9 @@ def _verify_root(root_text: str) -> ProtectedBrowserDeployment:
         manifest_path=manifest_path,
         deployment_id=manifest["deployment_id"],
         proxy_executable=proxy,
-        proxy_sha256=inventory[proxy_name],
+        proxy_sha256=inventory[proxy_name.casefold()][1],
         chromium_executable=chromium,
-        chromium_sha256=inventory[chromium_name],
+        chromium_sha256=inventory[chromium_name.casefold()][1],
         playwright_browsers_path=root / "playwright-browsers",
     )
 

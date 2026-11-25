@@ -36,6 +36,38 @@ def _authenticated_opener(proxy: StandaloneEgressProxy):
     )
 
 
+def test_non_demo_proxy_requires_explicit_dot_configuration(monkeypatch):
+    for name in (
+        "UNBOUND_DOT_RESOLVER_IP",
+        "UNBOUND_DOT_TLS_SERVER_NAME",
+        "UNBOUND_DOT_TIMEOUT_SECONDS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    with pytest.raises(ValueError, match="must be configured"):
+        StandaloneEgressProxy(port=18765, demo_only=False)
+
+    monkeypatch.setenv("UNBOUND_DOT_RESOLVER_IP", "1.1.1.1")
+    monkeypatch.setenv("UNBOUND_DOT_TLS_SERVER_NAME", "resolver.example")
+    monkeypatch.setenv("UNBOUND_DOT_TIMEOUT_SECONDS", "2.5")
+    proxy = StandaloneEgressProxy(port=18765, demo_only=False)
+    assert proxy._dns_resolver_ip == "1.1.1.1"
+    assert proxy._dns_tls_server_name == "resolver.example"
+    assert proxy._dns_timeout_seconds == 2.5
+
+
+def test_local_demo_proxy_does_not_require_dot_configuration(monkeypatch):
+    for name in (
+        "UNBOUND_DOT_RESOLVER_IP",
+        "UNBOUND_DOT_TLS_SERVER_NAME",
+        "UNBOUND_DOT_TIMEOUT_SECONDS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    proxy = StandaloneEgressProxy(port=18765, demo_only=True)
+    assert proxy._dns_resolver_ip is None
+    assert proxy._dns_tls_server_name is None
+    assert proxy._dns_timeout_seconds is None
+
+
 @pytest.mark.skipif(not default_proxy_executable().is_file(), reason="Build the standalone proxy executable first")
 def test_packaged_proxy_has_distinct_identity_fixed_endpoint_and_private_control_pipe():
     port = _available_loopback_port()

@@ -6,7 +6,7 @@ import logging
 import os
 import sys
 
-from backend.app.egress_proxy import LocalEgressProxy
+from backend.app.egress_proxy import DNSOverTLSResolver, DestinationPolicy, LocalEgressProxy
 
 
 def _emit(message: dict[str, object]) -> None:
@@ -27,9 +27,10 @@ def main() -> int:
         return 2
     try:
         config = json.loads(raw)
-        if not isinstance(config, dict) or set(config) != {
+        common_keys = {
             "host", "port", "demo_only", "proxy_secret", "max_body_bytes"
-        }:
+        }
+        if not isinstance(config, dict) or not common_keys <= set(config):
             raise ValueError
         if config["host"] != "127.0.0.1":
             raise ValueError
@@ -44,11 +45,27 @@ def main() -> int:
             or not isinstance(demo_only, bool)
         ):
             raise ValueError
-    except (ValueError, TypeError, json.JSONDecodeError):
+        policy = None
+        if demo_only:
+            if set(config) != common_keys:
+                raise ValueError
+        else:
+            required_dot = {"dns_resolver_ip", "dns_tls_server_name", "dns_timeout_seconds"}
+            if set(config) != common_keys | required_dot:
+                raise ValueError
+            policy = DestinationPolicy(
+                resolver=DNSOverTLSResolver(
+                    config["dns_resolver_ip"],
+                    config["dns_tls_server_name"],
+                    timeout=config["dns_timeout_seconds"],
+                )
+            )
+    except (ValueError, TypeError, RuntimeError, json.JSONDecodeError):
         _emit({"event": "error", "code": "invalid_startup_configuration"})
         return 2
 
     proxy = LocalEgressProxy(
+        policy=policy,
         demo_only=demo_only,
         port=port,
         proxy_secret=secret,
@@ -65,6 +82,7 @@ def main() -> int:
         "pid": os.getpid(),
         "host": "127.0.0.1",
         "port": port,
+        "dns_mode": "offline_demo" if demo_only else "dot",
     })
     try:
         for line in sys.stdin:

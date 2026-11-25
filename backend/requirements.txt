@@ -8,6 +8,7 @@ pymupdf>=1.24,<2
 python-docx>=1.1,<2
 playwright>=1.44,<2
 cryptography==50.0.2
+dnspython>=2.7,<3
 
 # Test dependency
 pytest>=8,<9

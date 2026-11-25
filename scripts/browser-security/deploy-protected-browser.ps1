@@ -10,14 +10,24 @@ $repository = (Resolve-Path -LiteralPath $RepositoryRoot).Path
 $proxySource = Join-Path $repository 'backend\app\browser\bin\unbound-egress-proxy'
 $proxyExecutable = Join-Path $proxySource 'unbound-egress-proxy.exe'
 if (-not (Test-Path -LiteralPath $proxyExecutable -PathType Leaf)) { throw 'Build the standalone proxy before deployment.' }
+$proxySource = (Resolve-Path -LiteralPath $proxySource).Path
+$proxyExecutable = (Resolve-Path -LiteralPath $proxyExecutable).Path
+Assert-UnboundNoReparsePoint $proxySource
+Assert-UnboundNoReparsePoint $proxyExecutable
 $browserCache = if ($PlaywrightBrowsersPath) { (Resolve-Path -LiteralPath $PlaywrightBrowsersPath).Path } else { Join-Path $repository '.playwright-browsers' }
 if (-not (Test-Path -LiteralPath $browserCache -PathType Container)) { throw 'Playwright browser cache is missing.' }
+$browserCache = (Resolve-Path -LiteralPath $browserCache).Path
+Assert-UnboundNoReparsePoint $browserCache
 $chromeCandidates = @(Get-ChildItem -LiteralPath $browserCache -Directory -Filter 'chromium-*' | ForEach-Object {
     Join-Path $_.FullName 'chrome-win64\chrome.exe'
 } | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
 if ($chromeCandidates.Count -ne 1) { throw 'Expected exactly one installed Playwright Chromium executable.' }
 $chromeSource = $chromeCandidates[0]
 $chromeSourceRoot = Split-Path (Split-Path $chromeSource -Parent) -Parent
+$chromeSource = (Resolve-Path -LiteralPath $chromeSource).Path
+$chromeSourceRoot = (Resolve-Path -LiteralPath $chromeSourceRoot).Path
+Assert-UnboundNoReparsePoint $chromeSourceRoot
+Assert-UnboundNoReparsePoint $chromeSource
 $chromiumFolder = Split-Path $chromeSourceRoot -Leaf
 $chromiumVersion = $chromiumFolder -replace '^chromium-', ''
 $destination = $script:UnboundDeploymentRoot
@@ -37,7 +47,10 @@ if (-not $PSCmdlet.ShouldProcess($destination, 'Deploy protected Chromium and st
 }
 
 New-Item -ItemType Directory -Path $stage | Out-Null
+$published = $false
 try {
+    # Protect the empty stage before any payload is copied into it.
+    Set-UnboundProtectedAcl $stage
     $proxyTarget = Join-Path $stage 'browser\proxy'
     $cacheTarget = Join-Path $stage 'playwright-browsers'
     New-Item -ItemType Directory -Path (Split-Path $proxyTarget -Parent), $cacheTarget | Out-Null
@@ -65,6 +78,7 @@ try {
     Set-UnboundProtectedAcl $stage
     [void](Test-UnboundDeployment $stage -CheckAcl -AllowStaging)
     Move-Item -LiteralPath $stage -Destination $destination
+    $published = $true
     [void](Test-UnboundDeployment $destination -CheckAcl)
     Write-Output "Protected deployment installed: $destination"
     Write-Output "Deployment ID: $deploymentId"
@@ -76,6 +90,17 @@ try {
         $stageItem = Get-Item -LiteralPath $stage -Force
         if ($stageItem.Name -like '.UNBOUND AI.stage-*' -and $stageItem.FullName.StartsWith($env:ProgramFiles, [System.StringComparison]::OrdinalIgnoreCase)) {
             Remove-Item -LiteralPath $stage -Recurse -Force
+        }
+    }
+    if ($published -and (Test-Path -LiteralPath $destination -PathType Container)) {
+        try {
+            if (Remove-UnboundFailedPublication $destination $deploymentId) {
+                Write-Warning 'The newly published deployment failed final verification and was rolled back.'
+            } else {
+                Write-Warning 'Final verification failed; the published path was retained because ownership could not be confirmed.'
+            }
+        } catch {
+            Write-Warning 'Final verification failed; rollback was not attempted because the new deployment identity could not be confirmed.'
         }
     }
     throw

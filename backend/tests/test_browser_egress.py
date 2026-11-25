@@ -4,11 +4,159 @@ import base64
 from http.client import HTTPConnection
 import ipaddress
 import socket
+import ssl
 import threading
 
 import pytest
 
+from backend.app.egress_proxy import DNSOverTLSResolver
 from backend.app.browser.egress import DestinationPolicy, EgressDenied, LocalEgressProxy, classify_address
+
+
+def _dns_response(query, records=()):
+    import dns.message
+    import dns.rrset
+    import dns.rdatatype
+
+    response = dns.message.make_response(query)
+    for record_type, address in records:
+        response.answer.append(dns.rrset.from_text(
+            query.question[0].name, 60, "IN", dns.rdatatype.to_text(record_type), address
+        ))
+    return response
+
+
+def test_dot_uses_pinned_numeric_resolver_ip_and_verified_tls_identity(monkeypatch):
+    import dns.rdatatype
+
+    calls = []
+
+    def query_tls(query, **kwargs):
+        calls.append((query.question[0].rdtype, kwargs))
+        record = ((dns.rdatatype.A, "93.184.216.34"),) if query.question[0].rdtype == dns.rdatatype.A else ()
+        return _dns_response(query, record)
+
+    resolver = DNSOverTLSResolver(
+        "1.1.1.1", "resolver.example", timeout=2.5, query_tls=query_tls
+    )
+    assert resolver("site.example", 443) == ("93.184.216.34",)
+    assert [item[0] for item in calls] == [dns.rdatatype.A, dns.rdatatype.AAAA]
+    for _rdtype, kwargs in calls:
+        assert kwargs["where"] == "1.1.1.1"
+        assert kwargs["port"] == 853
+        assert kwargs["server_hostname"] == "resolver.example"
+        assert kwargs["timeout"] == 2.5
+        assert kwargs["ssl_context"].verify_mode == ssl.CERT_REQUIRED
+        assert kwargs["ssl_context"].check_hostname is True
+
+
+@pytest.mark.parametrize("failure", [ssl.SSLCertVerificationError("bad certificate"), TimeoutError("timeout")])
+def test_dot_certificate_failure_and_timeout_fail_closed(failure):
+    resolver = DNSOverTLSResolver(
+        "1.1.1.1", "resolver.example", query_tls=lambda *_args, **_kwargs: (_ for _ in ()).throw(failure)
+    )
+    with pytest.raises(EgressDenied, match="could not be resolved safely"):
+        DestinationPolicy(resolver=resolver).validate("site.example", 443)
+
+
+def test_dot_malformed_response_and_empty_a_aaaa_fail_closed():
+    import dns.message
+
+    def malformed(query, **_kwargs):
+        return dns.message.make_response(dns.message.make_query("other.example", query.question[0].rdtype))
+
+    resolver = DNSOverTLSResolver("1.1.1.1", "resolver.example", query_tls=malformed)
+    with pytest.raises(EgressDenied, match="could not be resolved safely"):
+        DestinationPolicy(resolver=resolver).validate("site.example", 443)
+
+
+def test_dot_dns_error_response_code_fails_closed():
+    import dns.message
+    import dns.rcode
+
+    def server_failure(query, **_kwargs):
+        response = dns.message.make_response(query)
+        response.set_rcode(dns.rcode.SERVFAIL)
+        return response
+
+    resolver = DNSOverTLSResolver("1.1.1.1", "resolver.example", query_tls=server_failure)
+    with pytest.raises(EgressDenied, match="could not be resolved safely"):
+        DestinationPolicy(resolver=resolver).validate("site.example", 443)
+
+    resolver = DNSOverTLSResolver(
+        "1.1.1.1", "resolver.example", query_tls=lambda query, **_kwargs: _dns_response(query)
+    )
+    with pytest.raises(EgressDenied, match="could not be resolved safely"):
+        DestinationPolicy(resolver=resolver).validate("site.example", 443)
+
+
+def test_dot_mixed_public_private_answer_is_rejected():
+    import dns.rdatatype
+
+    def mixed(query, **_kwargs):
+        if query.question[0].rdtype == dns.rdatatype.A:
+            return _dns_response(query, ((dns.rdatatype.A, "93.184.216.34"),))
+        return _dns_response(query, ((dns.rdatatype.AAAA, "fd00::1"),))
+
+    resolver = DNSOverTLSResolver("1.1.1.1", "resolver.example", query_tls=mixed)
+    with pytest.raises(EgressDenied, match="non-public"):
+        DestinationPolicy(resolver=resolver).validate("site.example", 443)
+
+
+def test_dot_never_falls_back_to_system_dns(monkeypatch):
+    import dns.rdatatype
+
+    def no_system_dns(*_args, **_kwargs):
+        raise AssertionError("system DNS fallback was attempted")
+
+    monkeypatch.setattr(socket, "getaddrinfo", no_system_dns)
+    resolver = DNSOverTLSResolver(
+        "1.1.1.1", "resolver.example",
+        query_tls=lambda query, **_kwargs: _dns_response(
+            query,
+            ((dns.rdatatype.A, "93.184.216.34"),) if query.question[0].rdtype == dns.rdatatype.A else (),
+        ),
+    )
+    assert resolver("site.example", 443) == ("93.184.216.34",)
+
+
+def test_default_destination_policy_requires_dot_configuration_and_uses_dot(monkeypatch):
+    import dns.query
+    import dns.rdatatype
+
+    for name in ("UNBOUND_DOT_RESOLVER_IP", "UNBOUND_DOT_TLS_SERVER_NAME", "UNBOUND_DOT_TIMEOUT_SECONDS"):
+        monkeypatch.delenv(name, raising=False)
+    with pytest.raises(ValueError, match="must be configured"):
+        DestinationPolicy()
+
+    monkeypatch.setenv("UNBOUND_DOT_RESOLVER_IP", "1.1.1.1")
+    monkeypatch.setenv("UNBOUND_DOT_TLS_SERVER_NAME", "resolver.example")
+    monkeypatch.setenv("UNBOUND_DOT_TIMEOUT_SECONDS", "2")
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("system DNS fallback")),
+    )
+    monkeypatch.setattr(
+        dns.query,
+        "tls",
+        lambda query, **_kwargs: _dns_response(
+            query,
+            ((dns.rdatatype.A, "93.184.216.34"),) if query.question[0].rdtype == dns.rdatatype.A else (),
+        ),
+    )
+    assert DestinationPolicy().validate("site.example", 443).addresses == (
+        ipaddress.ip_address("93.184.216.34"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("resolver_ip", "server_name", "timeout"),
+    [("resolver.example", "resolver.example", 3), ("127.0.0.1", "resolver.example", 3), ("1.1.1.1", "bad name", 3), ("1.1.1.1", "resolver.example", 0)],
+)
+def test_dot_configuration_rejects_invalid_values(resolver_ip, server_name, timeout):
+    with pytest.raises(ValueError):
+        DNSOverTLSResolver(resolver_ip, server_name, timeout=timeout)
 
 
 @pytest.mark.parametrize(

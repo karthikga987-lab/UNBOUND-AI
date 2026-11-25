@@ -45,6 +45,9 @@ def _set_valid_key(monkeypatch):
 
 def test_application_startup_registers_six_gated_browser_tools_and_preserves_documents(tmp_path, monkeypatch):
     _set_valid_key(monkeypatch)
+    # This startup test exercises the offline fixture and does not need a
+    # public DNS resolver configuration.
+    monkeypatch.setenv("UNBOUND_BROWSER_LOCAL_DEMO", "1")
     monkeypatch.setenv("UNBOUND_DOCUMENT_IMPORT_DIR", str(tmp_path / "imports"))
     runtime = TaskRuntime(
         document_store=DocumentStore(tmp_path / "documents"),
@@ -66,7 +69,7 @@ def test_application_startup_registers_six_gated_browser_tools_and_preserves_doc
         assert {"document.upload", "document.search", "context.retrieve", "context.relate", "document.read_local_file"} <= names
         assert runtime.executor.verifier_for("document.search") is document_verifier
         assert runtime.executor.verifier_for("document.read_local_file") is not None
-        assert runtime.browser_integration_status == "disabled_pending_egress_review"
+        assert runtime.browser_integration_status == "local_demo_only"
         assert runtime.browser_egress_security_enabled is False
         assert runtime.browser_session_manager is not None
         assert runtime.browser_replay_bridge is not None
@@ -152,6 +155,7 @@ def test_shutdown_closes_browser_sessions_and_clears_recorders(tmp_path, monkeyp
 
 def test_missing_or_invalid_replay_key_registers_only_disabled_tools(tmp_path, monkeypatch):
     monkeypatch.delenv(ACTIVE_KEY_ENV, raising=False)
+    monkeypatch.delenv("UNBOUND_BROWSER_LOCAL_DEMO", raising=False)
     runtime = TaskRuntime()
     with TestClient(create_app(runtime)):
         assert runtime.browser_integration_status == "disabled_missing_replay_key"

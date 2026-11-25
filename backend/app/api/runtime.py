@@ -256,6 +256,18 @@ class TaskRuntime:
                 deployment_failure = "protected_deployment_unverified"
                 self.browser_deployment_failure_code = deployment_failure
         workflow_store = WorkflowStore(os.getenv("UNBOUND_BROWSER_WORKFLOW_DIR") or None)
+        key_setting = os.getenv("BROWSER_REPLAY_STATE_KEY")
+        replay_key_error = False
+        replay_key_error_type = "ReplayStateEncryptionConfigurationError"
+        if key_setting:
+            try:
+                from backend.app.browser.state_encryption import BrowserReplayStateCipher
+
+                BrowserReplayStateCipher()
+            except Exception as exc:
+                replay_key_error = True
+                replay_key_error_type = type(exc).__name__
+        proxy_not_started_for_missing_key = not local_demo and (not key_setting or replay_key_error)
         # Fixed port is required for an exact process-level proxy exception.
         # A collision fails closed; the runtime never silently picks another.
         egress_proxy = None
@@ -263,13 +275,14 @@ class TaskRuntime:
         try:
             if egress_proxy_error:
                 raise RuntimeError("protected deployment verification failed")
-            proxy_port = int(os.getenv("UNBOUND_BROWSER_EGRESS_PORT", "18765"))
-            egress_proxy = StandaloneEgressProxy(
-                demo_only=local_demo,
-                port=proxy_port,
-                executable=deployment.proxy_executable if deployment is not None else None,
-            )
-            egress_proxy.start()
+            if not proxy_not_started_for_missing_key:
+                proxy_port = int(os.getenv("UNBOUND_BROWSER_EGRESS_PORT", "18765"))
+                egress_proxy = StandaloneEgressProxy(
+                    demo_only=local_demo,
+                    port=proxy_port,
+                    executable=deployment.proxy_executable if deployment is not None else None,
+                )
+                egress_proxy.start()
         except (OSError, RuntimeError, ValueError):
             # Keep the API and its disabled tool registrations available; a
             # browser session cannot be created without this proxy.
@@ -290,7 +303,6 @@ class TaskRuntime:
             "bridge": None,
             "engine": None,
         }
-        key_setting = os.getenv("BROWSER_REPLAY_STATE_KEY")
         if egress_proxy_error:
             status = "disabled_protected_deployment_unverified" if deployment_failure else "disabled_egress_proxy_unavailable"
             detail = (
@@ -298,7 +310,10 @@ class TaskRuntime:
                 if deployment_failure else
                 "The standalone egress proxy could not be started on its configured loopback port; browser actions are disabled."
             )
-        elif not key_setting:
+        elif replay_key_error:
+            status = "disabled_invalid_replay_configuration"
+            detail = f"Replay encryption is unavailable ({replay_key_error_type}); browser actions are disabled."
+        elif proxy_not_started_for_missing_key or not key_setting:
             status = "disabled_missing_replay_key"
             detail = "Replay-state encryption is not configured; browser actions are disabled."
         elif key_setting:

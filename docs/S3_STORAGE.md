@@ -4,7 +4,7 @@ The optional `S3DocumentService` reads AWS credentials through the standard
 AWS shared profile/configuration chain. It does not expose credentials, create
 public URLs, set an object ACL, or provide a general delete operation.
 
-Defaults are bucket `unbound-ai-documents-2026-karthik`, region `ap-south-1`,
+Defaults are bucket `unbound-ai-documents-2026-karthik`, region `ap-southeast-2`,
 profile `unbound-ai-local`, and the `unbound/` object prefix. Uploads require an
 explicit `explicitly_approved=True` call, are limited to 20 MiB by default, and
 are checked with `head_object` for exact size and SHA-256 metadata. Downloads
@@ -63,8 +63,9 @@ comparison, and SQLite integrity check succeeded. The S3 object reported
 and was deliberately retained; no remote deletion was authorized. Prefix
 listing succeeded. `s3:GetBucketLocation` and `s3:GetBucketVersioning` were
 denied, so bucket-region metadata and versioning configuration were not
-independently queried (uploads/downloads through the configured ap-south-1
-client did succeed). No bucket is made public.
+independently queried by that earlier test. The bucket's verified region is
+`ap-southeast-2`; this region correction does not make any AWS API calls. No
+bucket is made public.
 
 ## Opt-in automatic application snapshots
 
@@ -92,7 +93,7 @@ The backend default is a 64 MiB snapshot limit. Configuration:
 ```powershell
 $env:UNBOUND_S3_SYNC_ENABLED = "1" # opt-in to background upload of the data scope above
 $env:UNBOUND_S3_BUCKET = "unbound-ai-documents-2026-karthik"
-$env:UNBOUND_S3_REGION = "ap-south-1"
+$env:UNBOUND_S3_REGION = "ap-southeast-2"
 $env:UNBOUND_S3_PROFILE = "unbound-ai-local"
 $env:UNBOUND_S3_SYNC_INTERVAL_SECONDS = "3600" # allowed: 60..86400
 $env:UNBOUND_S3_SYNC_PREFIX = "sync" # S3 key prefix below unbound/; default preserves unbound/sync/

@@ -13,7 +13,7 @@ from typing import Any, BinaryIO
 
 
 DEFAULT_BUCKET = "unbound-ai-documents-2026-karthik"
-DEFAULT_REGION = "ap-south-1"
+DEFAULT_REGION = "ap-southeast-2"
 DEFAULT_PROFILE = "unbound-ai-local"
 ALLOWED_PREFIX = "unbound/"
 DEFAULT_MAX_BYTES = 20 * 1024 * 1024

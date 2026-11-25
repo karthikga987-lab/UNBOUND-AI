@@ -121,6 +121,16 @@ class StandaloneEgressProxy:
                     "Protected mode requires the verified deployed proxy executable"
                 )
         self._expected_root = self.executable_path.parent.resolve()
+        self._dns_resolver_ip: str | None = None
+        self._dns_tls_server_name: str | None = None
+        self._dns_timeout_seconds: float | None = None
+        if not self.demo_only:
+            from backend.app.egress_proxy import DNSOverTLSResolver
+
+            configured_resolver = DNSOverTLSResolver.from_environment()
+            self._dns_resolver_ip = configured_resolver.resolver_ip
+            self._dns_tls_server_name = configured_resolver.tls_server_hostname
+            self._dns_timeout_seconds = configured_resolver.timeout
         self._secret = __import__("secrets").token_urlsafe(32)
         self._process: subprocess.Popen[str] | None = None
         self._image_lock: _ExecutableLock | None = None
@@ -238,6 +248,12 @@ class StandaloneEgressProxy:
                 "proxy_secret": self._secret,
                 "max_body_bytes": self.max_body_bytes,
             }
+            if not self.demo_only:
+                startup.update({
+                    "dns_resolver_ip": self._dns_resolver_ip,
+                    "dns_tls_server_name": self._dns_tls_server_name,
+                    "dns_timeout_seconds": self._dns_timeout_seconds,
+                })
             self._process.stdin.write(json.dumps(startup, separators=(",", ":")) + "\n")
             self._process.stdin.flush()
             try:
@@ -249,6 +265,7 @@ class StandaloneEgressProxy:
                 or response.get("pid") != self._process.pid
                 or response.get("host") != "127.0.0.1"
                 or response.get("port") != self.port
+                or (not self.demo_only and response.get("dns_mode") != "dot")
             ):
                 code = response.get("code")
                 raise StandaloneProxyError(

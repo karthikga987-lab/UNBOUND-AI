@@ -1,2 +1,3 @@
 # Build-only dependency for the separately identifiable Windows proxy image.
 PyInstaller==6.22.3
+dnspython>=2.7,<3

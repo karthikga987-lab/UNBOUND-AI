@@ -16,6 +16,7 @@ import secrets
 import select
 import socket
 import socketserver
+import ssl
 import threading
 from typing import Callable, Iterable
 from urllib.parse import urlsplit
@@ -30,6 +31,8 @@ class EgressDenied(ConnectionError):
 
 Resolver = Callable[[str, int], Iterable[str]]
 Connector = Callable[[ipaddress.IPv4Address | ipaddress.IPv6Address, int, float], socket.socket]
+DEFAULT_DOT_PORT = 853
+_MAX_DNS_ANSWERS = 128
 
 _BLOCKED_HOSTS = {
     "localhost", "local", "metadata", "metadata.google.internal", "metadata.azure.internal",
@@ -81,9 +84,144 @@ def classify_address(value: str | ipaddress.IPv4Address | ipaddress.IPv6Address)
     return bool(address.is_global and not address.is_multicast and not address.is_unspecified)
 
 
-def _system_resolver(host: str, port: int) -> tuple[str, ...]:
-    answers = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-    return tuple(dict.fromkeys(answer[4][0] for answer in answers))
+class DNSOverTLSResolver:
+    """Resolve hostnames over authenticated DoT to an explicitly pinned IP.
+
+    The configured resolver address is numeric, so establishing the TLS
+    connection never needs the Windows system resolver. The TLS server name is
+    independently checked against a certificate trusted by the OS CA store.
+    """
+
+    def __init__(
+        self,
+        resolver_ip: str,
+        tls_server_hostname: str,
+        *,
+        timeout: float = 3.0,
+        query_tls: Callable[..., object] | None = None,
+    ) -> None:
+        try:
+            address = ipaddress.ip_address(resolver_ip)
+        except (TypeError, ValueError):
+            raise ValueError("DNS-over-TLS resolver address must be a numeric public IP") from None
+        if not address.is_global or address.is_multicast or address.is_unspecified:
+            raise ValueError("DNS-over-TLS resolver address must be a numeric public IP")
+        if not isinstance(tls_server_hostname, str):
+            raise ValueError("DNS-over-TLS TLS server hostname is invalid")
+        try:
+            hostname = tls_server_hostname.rstrip(".").encode("idna").decode("ascii").lower()
+        except UnicodeError:
+            raise ValueError("DNS-over-TLS TLS server hostname is invalid") from None
+        if not _valid_dns_hostname(hostname):
+            raise ValueError("DNS-over-TLS TLS server hostname is invalid")
+        if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or not 0.1 <= float(timeout) <= 30:
+            raise ValueError("DNS-over-TLS timeout must be between 0.1 and 30 seconds")
+        self.resolver_ip = str(address)
+        self.tls_server_hostname = hostname
+        self.timeout = float(timeout)
+        self._query_tls = query_tls
+        self._ssl_context = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH)
+        if self._ssl_context.verify_mode != ssl.CERT_REQUIRED or not self._ssl_context.check_hostname:
+            raise ValueError("DNS-over-TLS certificate verification is required")
+        try:
+            import dns.message  # noqa: F401
+            import dns.query  # noqa: F401
+        except ImportError:
+            raise RuntimeError("DNS-over-TLS dependency is unavailable") from None
+
+    @classmethod
+    def from_environment(cls) -> "DNSOverTLSResolver":
+        import os
+
+        resolver_ip = os.getenv("UNBOUND_DOT_RESOLVER_IP", "")
+        tls_hostname = os.getenv("UNBOUND_DOT_TLS_SERVER_NAME", "")
+        timeout_text = os.getenv("UNBOUND_DOT_TIMEOUT_SECONDS", "")
+        if not resolver_ip or not tls_hostname or not timeout_text:
+            raise ValueError("DNS-over-TLS resolver IP, TLS server name, and timeout must be configured")
+        try:
+            timeout = float(timeout_text)
+        except (TypeError, ValueError):
+            raise ValueError("DNS-over-TLS timeout configuration is invalid") from None
+        return cls(resolver_ip, tls_hostname, timeout=timeout)
+
+    def __call__(self, host: str, _port: int) -> tuple[str, ...]:
+        try:
+            import dns.exception
+            import dns.flags
+            import dns.message
+            import dns.name
+            import dns.opcode
+            import dns.query
+            import dns.rcode
+            import dns.rdatatype
+            import dns.rdataclass
+        except ImportError:
+            raise RuntimeError("DNS-over-TLS dependency is unavailable") from None
+
+        query_tls = self._query_tls or dns.query.tls
+        try:
+            qname = dns.name.from_text(host, origin=dns.name.root).canonicalize()
+            if qname == dns.name.root or len(qname.to_wire()) > 255:
+                raise ValueError
+        except Exception:
+            raise ValueError("DNS query name is invalid") from None
+
+        addresses: list[str] = []
+        for rdtype in (dns.rdatatype.A, dns.rdatatype.AAAA):
+            query = dns.message.make_query(qname, rdtype, rdclass=dns.rdataclass.IN)
+            try:
+                response = query_tls(
+                    query,
+                    where=self.resolver_ip,
+                    timeout=self.timeout,
+                    port=DEFAULT_DOT_PORT,
+                    server_hostname=self.tls_server_hostname,
+                    ssl_context=self._ssl_context,
+                )
+            except Exception:
+                # Do not reveal the hostname, resolver response, or TLS details.
+                raise RuntimeError("DNS-over-TLS query failed") from None
+            if (
+                not hasattr(query, "is_response")
+                or not query.is_response(response)
+                or response.opcode() != dns.opcode.QUERY
+                or response.rcode() != dns.rcode.NOERROR
+                or response.flags & dns.flags.TC
+            ):
+                raise RuntimeError("DNS-over-TLS response was invalid")
+
+            reachable_names = {qname}
+            for _ in range(16):
+                changed = False
+                for rrset in response.answer:
+                    if rrset.rdclass == dns.rdataclass.IN and rrset.rdtype == dns.rdatatype.CNAME and rrset.name in reachable_names:
+                        for record in rrset:
+                            target = record.target.canonicalize()
+                            if target not in reachable_names:
+                                reachable_names.add(target)
+                                changed = True
+                if not changed:
+                    break
+
+            for rrset in response.answer:
+                if (
+                    rrset.rdclass == dns.rdataclass.IN
+                    and rrset.rdtype == rdtype
+                    and rrset.name in reachable_names
+                ):
+                    for record in rrset:
+                        addresses.append(record.address)
+                        if len(addresses) > _MAX_DNS_ANSWERS:
+                            raise RuntimeError("DNS-over-TLS response exceeded answer limit")
+
+        unique = tuple(dict.fromkeys(addresses))
+        if not unique:
+            raise RuntimeError("DNS-over-TLS returned no address records")
+        return unique
+
+
+def _offline_demo_resolver(_host: str, _port: int) -> tuple[str, ...]:
+    raise EgressDenied("DNS is unavailable in local demo mode")
 
 
 def _pinned_connector(address: ipaddress.IPv4Address | ipaddress.IPv6Address, port: int, timeout: float) -> socket.socket:
@@ -115,11 +253,11 @@ class DestinationPolicy:
     def __init__(
         self,
         *,
-        resolver: Resolver = _system_resolver,
+        resolver: Resolver | None = None,
         connector: Connector = _pinned_connector,
         connect_timeout: float = 10.0,
     ) -> None:
-        self._resolver = resolver
+        self._resolver = resolver if resolver is not None else DNSOverTLSResolver.from_environment()
         self._connector = connector
         self._connect_timeout = connect_timeout
 
@@ -153,7 +291,7 @@ class DestinationPolicy:
         # convenient public member from a mixed public/private answer.
         if not addresses or not all(classify_address(item) for item in addresses):
             raise EgressDenied("Destination includes a non-public address")
-        logger.info("browser egress allowed host=%s port=%s resolved_count=%s", host, port, len(addresses))
+        logger.info("browser egress allowed port=%s resolved_count=%s", port, len(addresses))
         return ValidatedDestination(host, port, addresses)
 
     def connect(self, hostname: str, port: int) -> socket.socket:
@@ -481,7 +619,14 @@ class LocalEgressProxy:
             raise ValueError("max_body_bytes must be positive")
         if not isinstance(port, int) or isinstance(port, bool) or not 0 <= port <= 65535:
             raise ValueError("proxy port must be between 0 and 65535")
-        self.policy = policy or DestinationPolicy()
+        if policy is not None:
+            self.policy = policy
+        elif demo_only:
+            # The fixture is served in-process and is deliberately independent
+            # of DNS configuration and network access.
+            self.policy = DestinationPolicy(resolver=_offline_demo_resolver)
+        else:
+            self.policy = DestinationPolicy()
         self.max_body_bytes = max_body_bytes
         self.demo_only = bool(demo_only)
         self.port = port
