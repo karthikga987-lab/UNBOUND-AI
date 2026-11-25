@@ -74,6 +74,19 @@ def test_application_startup_registers_six_gated_browser_tools_and_preserves_doc
         assert runtime.browser_egress_proxy.is_running
         status = client.get("/api/health").json()
         assert status["browser_egress_proxy_active"] is True
+        assert status["browser_egress_proxy_pid"] != os.getpid()
+        assert status["browser_egress_proxy_identity_verified"] is True
+        assert status["browser_egress_proxy_validation_working"] is True
+        assert status["browser_egress_proxy_endpoint"].startswith("http://127.0.0.1:")
+        assert status["browser_egress_proxy_endpoint"] == "http://127.0.0.1:18765"
+        assert status["browser_egress_proxy_executable"].endswith("unbound-egress-proxy.exe")
+        assert len(status["browser_egress_proxy_sha256"]) == 64
+        assert status["browser_chromium_executable"].endswith("chrome.exe")
+        assert len(status["browser_chromium_sha256"]) == 64
+        assert status["browser_chromium_identity_verified"] is False
+        assert status["browser_backend_pid"] == os.getpid()
+        assert status["browser_backend_identity_verified"] is True
+        assert status["browser_wfp_policy_installed"] is False
         assert status["browser_process_containment_verified"] is False
         assert status["browser_public_execution_enabled"] is False
         proxy = runtime.browser_egress_proxy
@@ -98,6 +111,8 @@ def test_runtime_honors_configured_proxy_port_in_local_demo(tmp_path, monkeypatc
         assert runtime.browser_egress_proxy.server.endswith(f":{port}")
         status = client.get("/api/health").json()
         assert status["browser_egress_proxy_active"] is True
+        assert status["browser_egress_proxy_endpoint"] == f"http://127.0.0.1:{port}"
+        assert status["browser_egress_proxy_pid"] != os.getpid()
         assert status["browser_process_containment_verified"] is False
         assert status["browser_public_execution_enabled"] is False
         proxy = runtime.browser_egress_proxy
@@ -151,12 +166,12 @@ def test_missing_or_invalid_replay_key_registers_only_disabled_tools(tmp_path, m
 
 def test_proxy_startup_failure_keeps_browser_actions_disabled(tmp_path, monkeypatch):
     _set_valid_key(monkeypatch)
-    from backend.app.browser.egress import LocalEgressProxy
+    from backend.app.browser.standalone_proxy import StandaloneEgressProxy
 
     def fail_start(_self):
         raise OSError("synthetic bind failure")
 
-    monkeypatch.setattr(LocalEgressProxy, "start", fail_start)
+    monkeypatch.setattr(StandaloneEgressProxy, "start", fail_start)
     runtime = TaskRuntime()
     with TestClient(create_app(runtime)):
         assert runtime.browser_integration_status == "disabled_egress_proxy_unavailable"

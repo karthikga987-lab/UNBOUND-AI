@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import os
+from pathlib import Path
+import sys
 from threading import Event
 from uuid import uuid4
 
@@ -78,12 +81,16 @@ def planned_runtime(*, verifier=lambda tool, expected, result: True, verified=Tr
 
 
 def test_application_starts_without_llm_credentials_and_health_is_honest(monkeypatch):
+    from backend.app.api.routes.health import _chromium_binary_identity
+
     monkeypatch.delenv("LLM_PROVIDER", raising=False)
     monkeypatch.delenv("LLM_MODEL", raising=False)
     monkeypatch.setenv("UNBOUND_S3_SYNC_ENABLED", "0")
     client = TestClient(create_app())
     response = client.get("/api/health")
     assert response.status_code == 200
+    chromium_path, chromium_hash = _chromium_binary_identity()
+    backend_executable = str(Path(sys.executable).resolve())
     assert response.json() == {
         "status": "ok",
         "llm_configured": False,
@@ -95,6 +102,22 @@ def test_application_starts_without_llm_credentials_and_health_is_honest(monkeyp
         "browser_integration_status": "not_initialized",
         "browser_local_demo_enabled": False,
         "browser_egress_proxy_active": False,
+        "browser_egress_proxy_endpoint": None,
+        "browser_egress_proxy_pid": None,
+        "browser_egress_proxy_executable": None,
+        "browser_egress_proxy_sha256": None,
+        "browser_egress_proxy_identity_verified": False,
+        "browser_egress_proxy_validation_working": False,
+        "browser_chromium_executable": chromium_path,
+        "browser_chromium_sha256": chromium_hash,
+        "browser_backend_pid": os.getpid(),
+        "browser_backend_executable": backend_executable,
+        "browser_backend_identity_verified": Path(backend_executable).is_file(),
+        "browser_wfp_policy_installed": False,
+        "browser_chromium_identity_verified": False,
+        "browser_ipv4_containment_verified": False,
+        "browser_ipv6_containment_verified": False,
+        "browser_direct_bypass_blocked": False,
         "browser_process_containment_verified": False,
         "browser_public_execution_status": "blocked_missing_process_containment",
         "s3_sync": {

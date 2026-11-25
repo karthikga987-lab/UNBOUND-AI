@@ -17,6 +17,7 @@ venv/
 .playwright-browsers/
 playwright-report/
 test-results/
+backend/app/browser/bin/unbound-egress-proxy/
 
 # Environment secrets
 .env

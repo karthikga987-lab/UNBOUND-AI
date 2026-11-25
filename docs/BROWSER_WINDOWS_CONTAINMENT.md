@@ -37,10 +37,11 @@ C:\Users\KARTHIK G A\UNBOUND-AI\.playwright-browsers\chromium-1255\chrome-win64\
 ```
 
 No custom WFP provider, sublayer, ALE filter installation, or rollback tool is
-currently included. Creating privileged WFP policy without an elevated test
-environment would leave its filtering and rollback behavior unverified, so no
-installer is supplied or run. Ordinary proxy settings and URL/DNS checks must
-not be described as process containment.
+currently included. The Codex process is not elevated, and creating privileged
+WFP policy without an elevated test environment would leave its arbitration,
+loopback exception, rollback, and unrelated-application behavior unverified.
+No system policy was applied and no WFP installer is supplied. Ordinary proxy
+settings and URL/DNS checks must not be described as process containment.
 
 ## WFP design findings
 
@@ -55,17 +56,64 @@ overlapping proxy exception cannot be assumed to work. Any implementation
 needs explicit non-overlapping conditions, transactional install/rollback,
 and tests against the host's existing policy.
 
-The current proxy is not a distinct OS process: `TaskRuntime` constructs
-`LocalEgressProxy` in the FastAPI process. A policy that allowed the Python
-executable to make proxy egress would also grant that same executable's other
-code the same identity. This does not meet the requested proxy identity
-boundary. Before a policy can be designed for both processes, the proxy must
-be isolated into a dedicated executable or restricted service identity, or a
-separately reviewed enforcement mechanism must constrain its destinations.
-The default proxy port is ephemeral (`UNBOUND_BROWSER_EGRESS_PORT=0`); a
-fixed, reserved loopback port must be configured for any exact WFP exception.
-Runtime support for that setting is present, but no firewall policy currently
-uses it.
+The intended Chrome rule set must be tied to the exact Chromium application
+ID and the configured proxy endpoint. At ALE_AUTH_CONNECT_V4, the permitted
+tuple is TCP to `127.0.0.1:18765`; every other Chromium IPv4 tuple must be
+blocked. Chromium IPv6 egress must be blocked because the proxy listens only
+on IPv4 loopback. The policy must also account for all Chromium subprocesses,
+DNS, UDP, QUIC, and proxy-offline behavior. Those rules are a design target,
+not an installed policy. Their WFP value encodings, filter weights, and
+arbitration have not been validated against this host.
+
+The standalone proxy's own ALE identity must be its exact packaged
+`unbound-egress-proxy.exe`, never `python.exe`. Its network policy must be
+limited to TCP HTTP/HTTPS egress and must block non-public destination ranges;
+the proxy's application-level DNS/IP validation remains necessary but is not
+a substitute for this OS policy. Exact WFP conditions for all non-global
+IPv4/IPv6 ranges and safe transactional rollback still require implementation
+and elevated testing.
+
+The proxy now runs as a separate packaged executable. FastAPI launches it as a
+child process with a distinct PID and communicates over private standard
+input/output pipes. A random per-runtime proxy credential and fixed loopback
+endpoint are sent at startup; the secret is not placed in command arguments,
+environment variables, health responses, or audit logs. The proxy fails
+startup if the configured port is occupied and never selects a fallback. The
+default is `127.0.0.1:18765`; `UNBOUND_BROWSER_EGRESS_PORT` can set another
+validated port for a matching policy. Local Demo Mode continues using its
+exact synthetic fixture restriction.
+
+The parent verifies the child PID, executable path, SHA-256, and a private
+authenticated policy probe. While the child is running, Windows opens the
+packaged executable read-only without write/delete sharing. This protects the
+image against replacement during that runtime; it is not a code signature,
+does not attest build provenance, and does not protect a writable package
+directory against replacement before startup. Deployments must protect the
+project-controlled directory with suitable filesystem ACLs and build from the
+pinned `requirements-browser-proxy-build.txt` dependency.
+
+Build the executable from project-owned source with:
+
+```powershell
+.\scripts\browser-security\build-egress-proxy.ps1
+```
+
+The build uses PyInstaller one-directory mode. Its output is ignored by Git
+at `backend/app/browser/bin/unbound-egress-proxy/`; a clean checkout must build
+it before starting the proxy runtime. The script refuses to overwrite an
+existing output. Runtime starts fail closed if the executable is missing, the
+port is occupied, or the authenticated validation probe fails.
+
+The API inventory reports backend PID/interpreter, proxy PID/path/hash, and
+the installed Chromium path/hash when exactly one Playwright Chromium is
+found. These are binary inventory fields, not evidence that WFP is installed
+or that network containment is verified. The proxy executable hash does not
+attest its `_internal` dependencies or publisher; the package directory and
+build toolchain remain part of the local trust boundary.
+
+The process separation and fixed endpoint blockers are resolved in application
+code, but no WFP policy currently uses the endpoint. Process-level egress
+containment remains unimplemented and unverified.
 
 WFP offers dynamic sessions whose objects are removed when their owning
 process exits, and persistent objects that remain until deleted. Dynamic

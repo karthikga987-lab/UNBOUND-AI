@@ -219,22 +219,22 @@ class TaskRuntime:
         """Build integration services locally so failures can clean partial state."""
         import os
         from backend.app.browser.controller import BrowserController
-        from backend.app.browser.egress import LocalEgressProxy
+        from backend.app.browser.standalone_proxy import StandaloneEgressProxy
         from backend.app.browser.session_manager import BrowserSessionManager
         from backend.app.browser.tools import BrowserToolAdapter
         from backend.app.browser.workflow_store import WorkflowStore
 
         local_demo = os.getenv("UNBOUND_BROWSER_LOCAL_DEMO") == "1"
         workflow_store = WorkflowStore(os.getenv("UNBOUND_BROWSER_WORKFLOW_DIR") or None)
-        # Use the same configured loopback port in either mode when an OS
-        # policy needs to permit Chromium to reach only this proxy. Port 0
-        # remains the safe default for an ephemeral local-only listener.
-        proxy_port = int(os.getenv("UNBOUND_BROWSER_EGRESS_PORT", "0"))
-        egress_proxy = LocalEgressProxy(demo_only=local_demo, port=proxy_port)
+        # Fixed port is required for an exact process-level proxy exception.
+        # A collision fails closed; the runtime never silently picks another.
+        egress_proxy = None
         egress_proxy_error = False
         try:
+            proxy_port = int(os.getenv("UNBOUND_BROWSER_EGRESS_PORT", "18765"))
+            egress_proxy = StandaloneEgressProxy(demo_only=local_demo, port=proxy_port)
             egress_proxy.start()
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             # Keep the API and its disabled tool registrations available; a
             # browser session cannot be created without this proxy.
             egress_proxy = None
@@ -257,7 +257,7 @@ class TaskRuntime:
         key_setting = os.getenv("BROWSER_REPLAY_STATE_KEY")
         if egress_proxy_error:
             status = "disabled_egress_proxy_unavailable"
-            detail = "The local network egress proxy could not be started; browser actions are disabled."
+            detail = "The standalone egress proxy could not be started on its configured loopback port; browser actions are disabled."
         elif not key_setting:
             status = "disabled_missing_replay_key"
             detail = "Replay-state encryption is not configured; browser actions are disabled."
