@@ -87,6 +87,13 @@ def test_application_startup_registers_six_gated_browser_tools_and_preserves_doc
         assert status["browser_backend_pid"] == os.getpid()
         assert status["browser_backend_identity_verified"] is True
         assert status["browser_wfp_policy_installed"] is False
+        assert status["browser_wfp_policy_verified"] is False
+        assert status["browser_wfp_policy_integrity_verified"] is False
+        assert status["browser_wfp_policy_ownership_verified"] is False
+        assert status["browser_dns_bypass_blocked"] is False
+        assert status["browser_udp_quic_bypass_blocked"] is False
+        assert status["browser_proxy_outbound_restrictions_verified"] is False
+        assert status["browser_proxy_shutdown_fail_closed_verified"] is False
         assert status["browser_process_containment_verified"] is False
         assert status["browser_public_execution_enabled"] is False
         proxy = runtime.browser_egress_proxy

@@ -74,10 +74,17 @@ def health(request: Request) -> dict[str, object]:
         "browser_backend_executable": backend_executable,
         "browser_backend_identity_verified": Path(backend_executable).is_file(),
         "browser_wfp_policy_installed": False,
+        "browser_wfp_policy_verified": False,
+        "browser_wfp_policy_integrity_verified": False,
+        "browser_wfp_policy_ownership_verified": False,
         "browser_chromium_identity_verified": False,
         "browser_ipv4_containment_verified": False,
         "browser_ipv6_containment_verified": False,
+        "browser_dns_bypass_blocked": False,
+        "browser_udp_quic_bypass_blocked": False,
         "browser_direct_bypass_blocked": False,
+        "browser_proxy_outbound_restrictions_verified": False,
+        "browser_proxy_shutdown_fail_closed_verified": False,
         # This process has no independently verified OS-level Chromium
         # containment signal. Keep it explicitly false until such a policy
         # is installed and verified outside application-level tests.

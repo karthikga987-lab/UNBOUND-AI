@@ -10,6 +10,7 @@ import urllib.request
 import pytest
 
 from backend.app.browser.egress import LOCAL_DEMO_PRODUCT_URL
+from backend.app.browser.controller import BrowserController, BrowserControllerError
 from backend.app.browser.standalone_proxy import (
     StandaloneEgressProxy,
     StandaloneProxyError,
@@ -105,6 +106,42 @@ def test_proxy_executable_cannot_be_opened_for_replacement_while_running():
         with pytest.raises(OSError):
             with proxy.executable_path.open("ab"):
                 pass
+        internal_runtime = proxy.executable_path.parent / "_internal" / "python314.dll"
+        if internal_runtime.is_file():
+            with pytest.raises(OSError):
+                with internal_runtime.open("ab"):
+                    pass
         assert proxy.identity_verified
     finally:
+        proxy.close()
+
+
+def test_child_stderr_is_not_forwarded_into_backend_logs(caplog):
+    from types import SimpleNamespace
+
+    proxy = object.__new__(StandaloneEgressProxy)
+    proxy._process = SimpleNamespace(stderr=iter([
+        "unexpected error proxy_secret=do-not-log https://private.example/path\n",
+    ]))
+    proxy._read_stderr()
+    assert "do-not-log" not in caplog.text
+    assert "private.example" not in caplog.text
+    assert "emitted a diagnostic" in caplog.text
+
+
+@pytest.mark.skipif(not default_proxy_executable().is_file(), reason="Build the standalone proxy executable first")
+def test_real_chromium_navigation_fails_after_proxy_shutdown():
+    proxy = StandaloneEgressProxy(port=_available_loopback_port(), demo_only=True).start()
+    browser = BrowserController(
+        proxy_server=proxy.server,
+        proxy_credentials=proxy.proxy_credentials,
+        headless=True,
+        timeout_ms=1500,
+    ).start()
+    try:
+        proxy.close()
+        with pytest.raises(BrowserControllerError):
+            browser.navigate(LOCAL_DEMO_PRODUCT_URL)
+    finally:
+        browser.close()
         proxy.close()

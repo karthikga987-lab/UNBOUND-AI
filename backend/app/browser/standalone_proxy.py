@@ -28,11 +28,11 @@ class StandaloneProxyError(RuntimeError):
 
 
 class _ExecutableLock:
-    """Hold the proxy image read-only without write/delete sharing on Windows."""
+    """Hold the packaged image read-only without write/delete sharing on Windows."""
 
     def __init__(self, path: Path) -> None:
-        self._handle = None
-        self._file = None
+        self._handles: list[object] = []
+        self._files = []
         if os.name == "nt":
             kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
             create_file = kernel32.CreateFileW
@@ -41,23 +41,37 @@ class _ExecutableLock:
                 ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
             ]
             create_file.restype = ctypes.c_void_p
-            handle = create_file(str(path), 0x80000000, 0x00000001, None, 3, 0x80, None)
-            if handle == ctypes.c_void_p(-1).value:
-                raise OSError(ctypes.get_last_error(), "could not lock proxy executable")
-            self._handle = handle
+            try:
+                # PyInstaller one-directory builds load Python and extension
+                # modules from _internal. Lock every existing file, not just
+                # the launcher, so a running proxy cannot have its package
+                # replaced underneath it.
+                for item in sorted(path.parent.rglob("*")):
+                    if item.is_symlink():
+                        raise OSError("proxy package contains a symbolic link")
+                    if not item.is_file():
+                        continue
+                    handle = create_file(str(item), 0x80000000, 0x00000001, None, 3, 0x80, None)
+                    if handle == ctypes.c_void_p(-1).value:
+                        raise OSError(ctypes.get_last_error(), "could not lock proxy package")
+                    self._handles.append(handle)
+            except Exception:
+                self.close()
+                raise
         else:
-            self._file = path.open("rb")
+            self._files.append(path.open("rb"))
 
     def close(self) -> None:
-        if self._handle is not None:
+        if self._handles:
             close_handle = ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle
             close_handle.argtypes = [ctypes.c_void_p]
             close_handle.restype = ctypes.c_int
-            close_handle(self._handle)
-            self._handle = None
-        if self._file is not None:
-            self._file.close()
-            self._file = None
+            for handle in reversed(self._handles):
+                close_handle(handle)
+            self._handles.clear()
+        for file in self._files:
+            file.close()
+        self._files.clear()
 
 
 def _sha256(path: Path) -> str:
@@ -158,9 +172,15 @@ class StandaloneEgressProxy:
         if process is None or process.stderr is None:
             return
         for line in process.stderr:
-            # The proxy emits only policy categories and destination host/port,
-            # never credentials, URLs, bodies, or document/page content.
-            logger.info("standalone egress proxy: %s", line.rstrip()[:512])
+            # Do not forward child-controlled text to backend logs: even an
+            # unexpected exception must not leak auth headers, URLs, or data.
+            value = line.rstrip()
+            if value.startswith("WARNING backend.app.egress_proxy browser egress denied category="):
+                logger.warning("standalone egress proxy reported a denied request")
+            elif value.startswith("INFO backend.app.egress_proxy browser egress allowed host="):
+                logger.info("standalone egress proxy allowed a validated destination")
+            else:
+                logger.warning("standalone egress proxy emitted a diagnostic")
 
     def start(self) -> "StandaloneEgressProxy":
         if self.is_running:

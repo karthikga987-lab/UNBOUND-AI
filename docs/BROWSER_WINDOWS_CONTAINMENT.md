@@ -85,12 +85,13 @@ exact synthetic fixture restriction.
 
 The parent verifies the child PID, executable path, SHA-256, and a private
 authenticated policy probe. While the child is running, Windows opens the
-packaged executable read-only without write/delete sharing. This protects the
-image against replacement during that runtime; it is not a code signature,
-does not attest build provenance, and does not protect a writable package
-directory against replacement before startup. Deployments must protect the
-project-controlled directory with suitable filesystem ACLs and build from the
-pinned `requirements-browser-proxy-build.txt` dependency.
+packaged executable and existing files in its `_internal` directory read-only
+without write/delete sharing. This prevents replacement of those files during
+that runtime. It is not a code signature, does not attest build provenance,
+and does not protect a writable package directory against replacement before
+startup. Deployments must protect the project-controlled directory with
+suitable filesystem ACLs and build from the pinned
+`requirements-browser-proxy-build.txt` dependency.
 
 Build the executable from project-owned source with:
 
@@ -109,7 +110,10 @@ the installed Chromium path/hash when exactly one Playwright Chromium is
 found. These are binary inventory fields, not evidence that WFP is installed
 or that network containment is verified. The proxy executable hash does not
 attest its `_internal` dependencies or publisher; the package directory and
-build toolchain remain part of the local trust boundary.
+build toolchain remain part of the local trust boundary. Health flags for WFP,
+direct bypass, IPv4/IPv6, DNS, and UDP/QUIC verification remain false until an
+external verifier supplies independent evidence; application code currently
+has no such WFP verifier.
 
 The process separation and fixed endpoint blockers are resolved in application
 code, but no WFP policy currently uses the endpoint. Process-level egress
