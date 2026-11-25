@@ -13,8 +13,17 @@ from backend.app.browser.tools import BrowserClickInput, BrowserFillInput, Brows
 from backend.app.schemas.contracts import EvidenceItem, EvidenceSourceType, TaskCreateRequest, TaskStep, TaskStatus, ToolCall
 
 
-def _proxy_request(proxy_url: str, url: str) -> tuple[int, str]:
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
+def _proxy_request(proxy: LocalEgressProxy, url: str) -> tuple[int, str]:
+    proxy_url = proxy.server
+    credentials = proxy.proxy_credentials
+    password_manager = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+    password_manager.add_password(
+        None, proxy_url, credentials["username"], credentials["password"]
+    )
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}),
+        urllib.request.ProxyBasicAuthHandler(password_manager),
+    )
     try:
         response = opener.open(url, timeout=3)
         return response.status, response.read().decode("utf-8", errors="replace")
@@ -25,13 +34,13 @@ def _proxy_request(proxy_url: str, url: str) -> tuple[int, str]:
 def test_local_demo_proxy_serves_only_fixed_synthetic_pages():
     proxy = LocalEgressProxy(demo_only=True).start()
     try:
-        status, page = _proxy_request(proxy.server, LOCAL_DEMO_PRODUCT_URL)
+        status, page = _proxy_request(proxy, LOCAL_DEMO_PRODUCT_URL)
         assert status == 200
         assert "Demo Product" in page
         assert "Version: 2.1" in page
         assert "All information on this page is synthetic" in page
 
-        status, details = _proxy_request(proxy.server, "http://unbound-demo.invalid/details")
+        status, details = _proxy_request(proxy, "http://unbound-demo.invalid/details")
         assert status == 200
         assert "document search, task planning, evidence summaries" in details
 
@@ -40,7 +49,7 @@ def test_local_demo_proxy_serves_only_fixed_synthetic_pages():
             "http://127.0.0.1/",
             "http://unbound-demo.invalid/not-a-fixture",
         ):
-            assert _proxy_request(proxy.server, denied)[0] == 403
+            assert _proxy_request(proxy, denied)[0] == 403
     finally:
         proxy.close()
 

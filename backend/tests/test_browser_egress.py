@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from http.client import HTTPConnection
 import ipaddress
 import socket
@@ -79,6 +80,21 @@ def test_dns_rebinding_is_revalidated_on_each_new_connection():
         policy.connect("rebound.example", 443)
 
 
+@pytest.mark.parametrize("host", ["127.1", "2130706433", "0177.0.0.1", "0x7f000001", "localhost", "singlelabel", "bad..example"])
+def test_noncanonical_ip_encodings_and_non_dns_hostnames_are_rejected(host):
+    policy = DestinationPolicy(resolver=lambda *_: ("93.184.216.34",))
+    with pytest.raises(EgressDenied):
+        policy.validate(host, 443)
+
+
+def test_disallowed_destination_ports_fail_before_dns_resolution():
+    calls = []
+    policy = DestinationPolicy(resolver=lambda *args: calls.append(args) or ("93.184.216.34",))
+    with pytest.raises(EgressDenied):
+        policy.validate("public.example", 8443)
+    assert calls == []
+
+
 @pytest.mark.parametrize(
     "host",
     [
@@ -119,7 +135,7 @@ class _PeerSocket:
         self.sock.close()
 
 
-def _fake_connector(resolver_map, path_responses=None, calls=None):
+def _fake_connector(resolver_map, path_responses=None, calls=None, requests=None):
     calls = calls if calls is not None else []
 
     def connect(address, port, _timeout):
@@ -134,6 +150,8 @@ def _fake_connector(resolver_map, path_responses=None, calls=None):
                     if not data:
                         return
                     request.extend(data)
+                if requests is not None:
+                    requests.append(bytes(request))
                 first_line = bytes(request).split(b"\r\n", 1)[0].decode("ascii", "replace")
                 path = first_line.split(" ")[1]
                 response = (path_responses or {}).get(
@@ -154,7 +172,11 @@ def _request(proxy: LocalEgressProxy, url: str):
     host_port = proxy.server.removeprefix("http://")
     host, port = host_port.rsplit(":", 1)
     connection = HTTPConnection(host, int(port), timeout=3)
-    connection.request("GET", url, headers={"Host": url.split("/", 3)[2]})
+    credentials = proxy.proxy_credentials
+    token = base64.b64encode(f"{credentials['username']}:{credentials['password']}".encode()).decode()
+    connection.request("GET", url, headers={
+        "Host": url.split("/", 3)[2], "Proxy-Authorization": f"Basic {token}",
+    })
     response = connection.getresponse()
     result = response.status, response.getheader("Location"), response.read()
     connection.close()
@@ -163,9 +185,10 @@ def _request(proxy: LocalEgressProxy, url: str):
 
 def test_proxy_accepts_public_http_and_connects_to_pinned_ip():
     calls = []
+    forwarded_requests = []
     policy = DestinationPolicy(
         resolver=lambda *_: ("93.184.216.34",),
-        connector=_fake_connector({}, calls=calls),
+        connector=_fake_connector({}, calls=calls, requests=forwarded_requests),
     )
     proxy = LocalEgressProxy(policy=policy).start()
     try:
@@ -173,6 +196,8 @@ def test_proxy_accepts_public_http_and_connects_to_pinned_ip():
         assert status == 200
         assert body == b"ok"
         assert calls == [("93.184.216.34", 80)]
+        assert b"Proxy-Authorization" not in forwarded_requests[0]
+        assert proxy.proxy_credentials["password"].encode() not in forwarded_requests[0]
     finally:
         proxy.close()
 
@@ -214,7 +239,11 @@ def test_https_connect_is_tunneled_to_the_pinned_public_address():
     proxy = LocalEgressProxy(policy=policy).start()
     sock = socket.create_connection(tuple(proxy._server.server_address), timeout=3)
     try:
-        sock.sendall(b"CONNECT secure.example:443 HTTP/1.1\r\nHost: secure.example:443\r\n\r\n")
+        credentials = proxy.proxy_credentials
+        token = base64.b64encode(f"{credentials['username']}:{credentials['password']}".encode()).decode()
+        sock.sendall(
+            f"CONNECT secure.example:443 HTTP/1.1\r\nHost: secure.example:443\r\nProxy-Authorization: Basic {token}\r\n\r\n".encode()
+        )
         response = b""
         while b"\r\n\r\n" not in response:
             response += sock.recv(4096)
@@ -224,6 +253,26 @@ def test_https_connect_is_tunneled_to_the_pinned_public_address():
         assert calls == [("93.184.216.34", 443)]
     finally:
         sock.close()
+        proxy.close()
+
+
+def test_proxy_requires_per_process_authentication():
+    calls = []
+    proxy = LocalEgressProxy(policy=DestinationPolicy(
+        resolver=lambda *_: ("93.184.216.34",),
+        connector=_fake_connector({}, calls=calls),
+    )).start()
+    try:
+        host, port = proxy._server.server_address[:2]
+        connection = HTTPConnection(host, port, timeout=3)
+        connection.request("GET", "http://public.example/", headers={"Host": "public.example"})
+        response = connection.getresponse()
+        assert response.status == 407
+        assert response.getheader("Proxy-Authenticate")
+        response.read()
+        connection.close()
+        assert calls == []
+    finally:
         proxy.close()
 
 

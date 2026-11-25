@@ -94,6 +94,8 @@ def test_application_starts_without_llm_credentials_and_health_is_honest(monkeyp
         "browser_public_execution_enabled": False,
         "browser_integration_status": "not_initialized",
         "browser_local_demo_enabled": False,
+        "browser_egress_proxy_active": False,
+        "browser_process_containment_verified": False,
         "browser_public_execution_status": "blocked_missing_process_containment",
         "s3_sync": {
             "enabled": False,

@@ -123,6 +123,7 @@ class BrowserController:
         self,
         *,
         proxy_server: str | None = None,
+        proxy_credentials: Mapping[str, str] | None = None,
         headless: bool = True,
         timeout_ms: int = 10_000,
         download_store: BrowserDownloadStore | None = None,
@@ -131,6 +132,9 @@ class BrowserController:
             raise ValueError("timeout_ms must be a positive integer")
         self.headless = headless
         self.proxy_server = proxy_server
+        self.proxy_credentials = dict(proxy_credentials or {})
+        if set(self.proxy_credentials) - {"username", "password"}:
+            raise ValueError("proxy credentials have an invalid shape")
         self.timeout_ms = timeout_ms
         self.download_store = download_store or BrowserDownloadStore()
         self._playwright = None
@@ -163,19 +167,26 @@ class BrowserController:
             or not isinstance(proxy_ip, ipaddress.IPv4Address)
             or not proxy_ip.is_loopback
             or proxy_port is None
+            or set(self.proxy_credentials) != {"username", "password"}
+            or any(not isinstance(value, str) or not value for value in self.proxy_credentials.values())
         ):
             raise BrowserControllerError(
-                "start", "A managed loopback egress proxy is required for browser sessions"
+                "start", "A managed loopback egress proxy with authentication is required for browser sessions"
             )
         sync_playwright = _load_playwright()
         try:
             self._playwright = sync_playwright().start()
+            proxy_settings = {"server": self.proxy_server, "bypass": "<-loopback>"}
+            proxy_settings.update(self.proxy_credentials)
             self._browser = self._playwright.chromium.launch(
                 headless=self.headless,
-                proxy={"server": self.proxy_server, "bypass": "<-loopback>"},
+                proxy=proxy_settings,
                 args=[
                     "--disable-quic",
                     "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+                    "--disable-background-networking",
+                    "--disable-component-update",
+                    "--disable-domain-reliability",
                 ],
             )
             self._context = self._browser.new_context(service_workers="block")

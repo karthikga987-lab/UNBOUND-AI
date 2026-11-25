@@ -19,6 +19,14 @@ def health(request: Request) -> dict[str, object]:
         "browser_public_execution_enabled": runtime.browser_egress_security_enabled,
         "browser_integration_status": runtime.browser_integration_status,
         "browser_local_demo_enabled": os.getenv("UNBOUND_BROWSER_LOCAL_DEMO") == "1",
+        "browser_egress_proxy_active": bool(
+            runtime.browser_egress_proxy is not None
+            and runtime.browser_egress_proxy.is_running
+        ),
+        # This process has no independently verified OS-level Chromium
+        # containment signal. Keep it explicitly false until such a policy
+        # is installed and verified outside application-level tests.
+        "browser_process_containment_verified": False,
         "browser_public_execution_status": (
             "enabled_verified" if runtime.browser_egress_security_enabled
             else "blocked_missing_process_containment"

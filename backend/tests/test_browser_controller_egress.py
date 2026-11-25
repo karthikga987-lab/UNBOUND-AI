@@ -71,13 +71,18 @@ def test_controller_configures_proxy_and_context_request_guard(monkeypatch):
             return Playwright()
 
     monkeypatch.setattr("backend.app.browser.controller._load_playwright", lambda: lambda: SyncPlaywright())
-    controller = BrowserController(proxy_server="http://127.0.0.1:8123").start()
+    controller = BrowserController(
+        proxy_server="http://127.0.0.1:8123",
+        proxy_credentials={"username": "unbound", "password": "synthetic-secret"},
+    ).start()
     try:
         assert captured["launch"]["proxy"] == {
-            "server": "http://127.0.0.1:8123", "bypass": "<-loopback>"
+            "server": "http://127.0.0.1:8123", "bypass": "<-loopback>",
+            "username": "unbound", "password": "synthetic-secret",
         }
         assert "--disable-quic" in captured["launch"]["args"]
         assert "--force-webrtc-ip-handling-policy=disable_non_proxied_udp" in captured["launch"]["args"]
+        assert "--disable-background-networking" in captured["launch"]["args"]
         assert captured["context"] == {"service_workers": "block"}
         pattern, handler = captured["route"]
         assert pattern == "**/*"

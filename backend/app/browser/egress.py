@@ -8,13 +8,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
+import base64
 import ipaddress
+import logging
+import re
+import secrets
 import select
 import socket
 import socketserver
 import threading
 from typing import Callable, Iterable
 from urllib.parse import urlsplit
+
+
+logger = logging.getLogger(__name__)
 
 
 class EgressDenied(ConnectionError):
@@ -117,7 +124,7 @@ class DestinationPolicy:
         self._connect_timeout = connect_timeout
 
     def validate(self, hostname: str, port: int) -> ValidatedDestination:
-        if not isinstance(hostname, str) or not hostname or not (1 <= port <= 65535):
+        if not isinstance(hostname, str) or not hostname or port not in {80, 443}:
             raise EgressDenied("Invalid destination")
         host = hostname.rstrip(".").lower()
         if not host or host in _BLOCKED_HOSTS or host.endswith(_BLOCKED_SUFFIXES):
@@ -129,6 +136,8 @@ class DestinationPolicy:
         except ValueError:
             try:
                 ascii_host = host.encode("idna").decode("ascii")
+                if not _valid_dns_hostname(ascii_host):
+                    raise ValueError("invalid hostname")
                 raw_addresses = tuple(self._resolver(ascii_host, port))
             except Exception:
                 raise EgressDenied("Destination could not be resolved safely") from None
@@ -144,6 +153,7 @@ class DestinationPolicy:
         # convenient public member from a mixed public/private answer.
         if not addresses or not all(classify_address(item) for item in addresses):
             raise EgressDenied("Destination includes a non-public address")
+        logger.info("browser egress allowed host=%s port=%s resolved_count=%s", host, port, len(addresses))
         return ValidatedDestination(host, port, addresses)
 
     def connect(self, hostname: str, port: int) -> socket.socket:
@@ -166,6 +176,24 @@ class DestinationPolicy:
         raise EgressDenied("Could not connect to a validated public address") from last_error
 
 
+def _valid_dns_hostname(host: str) -> bool:
+    """Accept ordinary multi-label DNS names, never resolver shorthand."""
+    if len(host) > 253 or not host or host.endswith("."):
+        return False
+    numeric_parts = r"(?:0[xX][0-9a-fA-F]+|[0-9]+)"
+    if re.fullmatch(rf"{numeric_parts}(?:\.{numeric_parts}){{0,3}}", host):
+        return False
+    labels = host.split(".")
+    if len(labels) < 2:
+        return False
+    for label in labels:
+        if not 1 <= len(label) <= 63 or label.startswith("-") or label.endswith("-"):
+            return False
+        if not all(character.isascii() and (character.isalnum() or character == "-") for character in label):
+            return False
+    return not labels[-1].isdigit()
+
+
 def _parse_authority(authority: str) -> tuple[str, int]:
     try:
         parts = urlsplit("//" + authority)
@@ -182,10 +210,11 @@ class _ThreadedHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
     allow_reuse_address = True
     request_queue_size = 64
 
-    def __init__(self, address, handler, policy: DestinationPolicy, max_body_bytes: int, demo_only: bool):
+    def __init__(self, address, handler, policy: DestinationPolicy, max_body_bytes: int, demo_only: bool, proxy_secret: str):
         self.policy = policy
         self.max_body_bytes = max_body_bytes
         self.demo_only = demo_only
+        self.proxy_secret = proxy_secret
         super().__init__(address, handler)
 
 
@@ -211,18 +240,34 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         # Do not log URLs, hostnames, headers, or page-provided content.
         return
 
-    def _deny(self, status: int = 403) -> None:
+    def _deny(self, status: int = 403, *, authenticate: bool = False) -> None:
         try:
             self.send_response(status)
+            if authenticate:
+                self.send_header("Proxy-Authenticate", 'Basic realm="UNBOUND managed proxy"')
             self.send_header("Content-Length", "0")
             self.send_header("Connection", "close")
             self.end_headers()
         except OSError:
             pass
 
+    def _require_proxy_authentication(self) -> None:
+        values = self.headers.get_all("Proxy-Authorization", [])
+        if len(values) != 1 or not values[0].startswith("Basic "):
+            raise EgressDenied("Proxy authentication required")
+        try:
+            decoded = base64.b64decode(values[0][6:], validate=True).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            raise EgressDenied("Proxy authentication required") from None
+        expected = f"unbound:{self.server.proxy_secret}"  # type: ignore[attr-defined]
+        import hmac
+        if not hmac.compare_digest(decoded, expected):
+            raise EgressDenied("Proxy authentication required")
+
     def do_CONNECT(self) -> None:
         upstream = None
         try:
+            self._require_proxy_authentication()
             if self.demo_only:
                 raise EgressDenied("HTTPS is disabled in local demo mode")
             host, port = _parse_authority(self.path)
@@ -231,8 +276,10 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             upstream = self.policy.connect(host, port)
             self.connection.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             self._tunnel(upstream)
-        except EgressDenied:
-            self._deny(403)
+        except EgressDenied as exc:
+            logger.warning("browser egress denied category=%s", str(exc))
+            needs_auth = str(exc) == "Proxy authentication required"
+            self._deny(407 if needs_auth else 403, authenticate=needs_auth)
         except (OSError, TimeoutError):
             self._deny(502)
         finally:
@@ -242,6 +289,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
     def _plain_http(self) -> None:
         upstream = None
         try:
+            self._require_proxy_authentication()
             target = urlsplit(self.path)
             if target.scheme.lower() != "http" or not target.hostname:
                 raise EgressDenied("Only absolute HTTP destinations are supported")
@@ -277,8 +325,10 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             upstream.sendall(request_line + b"".join(headers) + b"Connection: close\r\n\r\n")
             self._copy_request_body(upstream)
             self._tunnel(upstream)
-        except EgressDenied:
-            self._deny(403)
+        except EgressDenied as exc:
+            logger.warning("browser egress denied category=%s", str(exc))
+            needs_auth = str(exc) == "Proxy authentication required"
+            self._deny(407 if needs_auth else 403, authenticate=needs_auth)
         except (OSError, TimeoutError, ValueError):
             self._deny(502)
         finally:
@@ -422,12 +472,17 @@ class LocalEgressProxy:
         policy: DestinationPolicy | None = None,
         max_body_bytes: int = 20 * 1024 * 1024,
         demo_only: bool = False,
+        port: int = 0,
     ) -> None:
         if max_body_bytes <= 0:
             raise ValueError("max_body_bytes must be positive")
+        if not isinstance(port, int) or isinstance(port, bool) or not 0 <= port <= 65535:
+            raise ValueError("proxy port must be between 0 and 65535")
         self.policy = policy or DestinationPolicy()
         self.max_body_bytes = max_body_bytes
         self.demo_only = bool(demo_only)
+        self.port = port
+        self._proxy_secret = secrets.token_urlsafe(32)
         self._server: _ThreadedHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -439,6 +494,10 @@ class LocalEgressProxy:
         return f"http://{host}:{port}"
 
     @property
+    def proxy_credentials(self) -> dict[str, str]:
+        return {"username": "unbound", "password": self._proxy_secret}
+
+    @property
     def is_running(self) -> bool:
         return self._server is not None and self._thread is not None and self._thread.is_alive()
 
@@ -446,7 +505,8 @@ class LocalEgressProxy:
         if self.is_running:
             return self
         server = _ThreadedHTTPServer(
-            ("127.0.0.1", 0), _ProxyHandler, self.policy, self.max_body_bytes, self.demo_only
+            ("127.0.0.1", self.port), _ProxyHandler, self.policy, self.max_body_bytes,
+            self.demo_only, self._proxy_secret,
         )
         thread = threading.Thread(target=server.serve_forever, name="unbound-egress-proxy", daemon=True)
         try:

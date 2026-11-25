@@ -226,7 +226,11 @@ class TaskRuntime:
 
         local_demo = os.getenv("UNBOUND_BROWSER_LOCAL_DEMO") == "1"
         workflow_store = WorkflowStore(os.getenv("UNBOUND_BROWSER_WORKFLOW_DIR") or None)
-        egress_proxy = LocalEgressProxy(demo_only=local_demo)
+        # Use the same configured loopback port in either mode when an OS
+        # policy needs to permit Chromium to reach only this proxy. Port 0
+        # remains the safe default for an ephemeral local-only listener.
+        proxy_port = int(os.getenv("UNBOUND_BROWSER_EGRESS_PORT", "0"))
+        egress_proxy = LocalEgressProxy(demo_only=local_demo, port=proxy_port)
         egress_proxy_error = False
         try:
             egress_proxy.start()
@@ -238,6 +242,7 @@ class TaskRuntime:
         session_manager = BrowserSessionManager(
             controller_factory=lambda: BrowserController(
                 proxy_server=egress_proxy.server if egress_proxy is not None else None,
+                proxy_credentials=egress_proxy.proxy_credentials if egress_proxy is not None else None,
                 headless=not local_demo or os.getenv("UNBOUND_BROWSER_LOCAL_DEMO_HEADLESS") == "1",
             )
         )

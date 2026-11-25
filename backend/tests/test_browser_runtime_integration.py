@@ -55,7 +55,7 @@ def test_application_startup_registers_six_gated_browser_tools_and_preserves_doc
     document_verifier = lambda _tool, _expected, result: bool(result.success)
     runtime.configure_verifier("document.search", document_verifier)
 
-    with TestClient(create_app(runtime)):
+    with TestClient(create_app(runtime)) as client:
         names = {tool.tool_name for tool in runtime.registry.list_tools()}
         expected_browser = {
             "browser.navigate", "browser.click", "browser.fill",
@@ -72,6 +72,34 @@ def test_application_startup_registers_six_gated_browser_tools_and_preserves_doc
         assert runtime.browser_replay_bridge is not None
         assert runtime.browser_egress_proxy is not None
         assert runtime.browser_egress_proxy.is_running
+        status = client.get("/api/health").json()
+        assert status["browser_egress_proxy_active"] is True
+        assert status["browser_process_containment_verified"] is False
+        assert status["browser_public_execution_enabled"] is False
+        proxy = runtime.browser_egress_proxy
+
+    assert not proxy.is_running
+
+
+def test_runtime_honors_configured_proxy_port_in_local_demo(tmp_path, monkeypatch):
+    import socket
+
+    _set_valid_key(monkeypatch)
+    monkeypatch.setenv("UNBOUND_BROWSER_LOCAL_DEMO", "1")
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    monkeypatch.setenv("UNBOUND_BROWSER_EGRESS_PORT", str(port))
+    runtime = TaskRuntime()
+
+    with TestClient(create_app(runtime)) as client:
+        assert runtime.browser_egress_proxy is not None
+        assert runtime.browser_egress_proxy.is_running
+        assert runtime.browser_egress_proxy.server.endswith(f":{port}")
+        status = client.get("/api/health").json()
+        assert status["browser_egress_proxy_active"] is True
+        assert status["browser_process_containment_verified"] is False
+        assert status["browser_public_execution_enabled"] is False
         proxy = runtime.browser_egress_proxy
 
     assert not proxy.is_running
