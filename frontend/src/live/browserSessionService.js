@@ -1,17 +1,17 @@
 // Browser session service abstraction for the Live View.
-//
-// NO browser-session endpoints exist in the backend yet (Member 2's engine is not integrated).
-// Nothing is hardcoded: every endpoint comes from env variables. With none set, the service
-// reports the capabilities as unavailable and the UI says so instead of showing fake activity.
-// See frontend/docs/LIVE_VIEW_CONTRACT.md for how to connect the real backend.
+// The backend provides task-scoped browser-event polling. Pause/resume remain
+// unavailable unless a backend explicitly configures those control endpoints.
+// See frontend/docs/LIVE_VIEW_CONTRACT.md for the supported event contract.
 import { buildUrl, ConnectionStatus, openLiveConnection } from './transport'
 
-const TRANSPORTS = new Set(['websocket', 'sse', 'polling'])
+const TRANSPORTS = new Set(['websocket', 'sse', 'polling', 'none'])
 
 export function getLiveConfig(env = import.meta.env) {
+  const apiBase = String(env.VITE_API_BASE_URL ?? '').replace(/\/$/, '')
+  const configuredTransport = env.VITE_LIVE_TRANSPORT
   return {
-    transport: TRANSPORTS.has(env.VITE_LIVE_TRANSPORT) ? env.VITE_LIVE_TRANSPORT : 'none',
-    eventsUrl: env.VITE_LIVE_EVENTS_URL ?? '',
+    transport: configuredTransport === undefined ? 'polling' : TRANSPORTS.has(configuredTransport) ? configuredTransport : 'none',
+    eventsUrl: env.VITE_LIVE_EVENTS_URL ?? `${apiBase}/api/tasks/{task_id}/browser-events?after={after}`,
     pollMs: Number(env.VITE_LIVE_POLL_MS) || 1500,
     pauseUrl: env.VITE_LIVE_PAUSE_URL ?? '',
     resumeUrl: env.VITE_LIVE_RESUME_URL ?? '',

@@ -52,6 +52,8 @@ def test_allowed_voice_prototype_origin_can_create_a_session(tmp_path):
     "http://127.0.0.1:5173",
     "http://127.0.0.1:5174",
     "http://127.0.0.1:5175",
+    "http://127.0.0.1:5176",
+    "http://127.0.0.1:5178",
 ])
 def test_allowed_vite_dev_origins_can_create_a_session(tmp_path, origin):
     client = make_client(tmp_path)
@@ -61,7 +63,12 @@ def test_allowed_vite_dev_origins_can_create_a_session(tmp_path, origin):
     assert response.status_code == 201
 
 
-@pytest.mark.parametrize("origin", ["http://localhost:5174", "http://localhost:5175", "https://localhost:5173"])
+@pytest.mark.parametrize("origin", [
+    "http://localhost:5174",
+    "http://localhost:5175",
+    "http://localhost:5176",
+    "https://localhost:5173",
+])
 def test_other_vite_origins_cannot_mutate_local_state(tmp_path, origin):
     client = make_client(tmp_path)
 
@@ -69,6 +76,27 @@ def test_other_vite_origins_cannot_mutate_local_state(tmp_path, origin):
 
     assert response.status_code == 403
     assert response.json()["detail"]["code"] == "origin_not_allowed"
+
+
+def test_browserless_origin_is_exact_and_cors_preflight_is_allowed(tmp_path):
+    client = make_client(tmp_path)
+
+    preflight = client.options(
+        "/api/assistant/requests",
+        headers={
+            "Origin": "http://127.0.0.1:5178",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type",
+        },
+    )
+    accepted = client.post("/api/conversations", headers={"Origin": "http://127.0.0.1:5178"})
+    alias = client.post("/api/conversations", headers={"Origin": "http://localhost:5178"})
+
+    assert preflight.status_code == 200
+    assert preflight.headers["access-control-allow-origin"] == "http://127.0.0.1:5178"
+    assert accepted.status_code == 201
+    assert alias.status_code == 403
+    assert alias.json()["detail"]["code"] == "origin_not_allowed"
 
 
 def test_task_state_does_not_survive_runtime_recreation(tmp_path):

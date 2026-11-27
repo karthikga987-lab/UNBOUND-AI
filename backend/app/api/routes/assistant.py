@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import json
 import os
+import re
 from pathlib import PureWindowsPath
 from typing import Any
 from uuid import uuid4
@@ -16,6 +17,8 @@ from backend.app.assistant.intent import (
     AssistantIntent,
     AssistantIntentCategory,
     classify_assistant_intent,
+    is_public_web_research_request,
+    public_web_search_tool_names,
 )
 from backend.app.assistant.reminder_intent import parse_reminder_command
 from backend.app.assistant.task_context import (
@@ -99,14 +102,49 @@ def _tool_inventory(runtime: Any) -> list[dict[str, Any]]:
     ]
 
 
+def _uploaded_document_selection(runtime: Any, message: str) -> tuple[Any | None, str | None]:
+    """Select an already-ingested upload; never infer or open an arbitrary path."""
+    store = getattr(runtime, "document_store", None)
+    if store is None:
+        return None, "Uploaded document access is unavailable in this runtime. No file was opened."
+    records = [
+        item for item in store.list_records()
+        if getattr(item.extraction_status, "value", item.extraction_status) == "success"
+    ]
+    references = re.findall(r"(?i)([\w.-]+\.(?:pdf|docx|txt))\b", message)
+    if references:
+        matched = [record for record in records if any(record.original_filename.casefold() == name.casefold() for name in references)]
+        if len(matched) == 1:
+            return matched[0], None
+        if not matched:
+            return None, "I couldn't find that filename among successfully uploaded documents. Upload it in Connected data, then ask me to analyze it. No file was opened."
+        return None, "I found more than one matching uploaded document. Please choose one by its displayed filename."
+    if len(records) == 1:
+        return records[0], None
+    if not records:
+        return None, "I don't see a successfully uploaded document yet. Upload it in Connected data, then ask me to analyze it. No file was opened."
+    names = ", ".join(record.original_filename for record in records[:8])
+    return None, f"Which uploaded document should I analyze? Available files: {names}."
+
+
+def _uploaded_analysis_step(record: Any, message: str) -> TaskStep:
+    focus = "Summarize this document"
+    specific = re.search(r"(?i)\b(?:focus(?:ing)?\s+on|about|for)\s+(.+)$", message)
+    if specific:
+        focus = specific.group(1).strip()[:1000] or focus
+    return TaskStep(
+        step_id="analyze_uploaded_document",
+        tool_name="document.analyze_uploaded",
+        description=f"Analyze the already-uploaded document {record.original_filename} and attach exact source excerpts.",
+        input={"document_id": record.document_id, "analysis_request": focus},
+        requires_approval=False,
+        expected_outcome="Local Ollama returns an analysis whose findings are validated against exact excerpts from the selected uploaded document.",
+    )
+
+
 @router.post("/classify", response_model=AssistantIntent)
 def classify_request(body: AssistantRequest, request: Request) -> AssistantIntent:
-    """Classify a turn without answering it or creating/executing a task.
-
-    The React client uses this boundary to choose between the persistent
-    conversation API and the assistant task-preparation API. The same validated
-    classifier remains authoritative for the later assistant request.
-    """
+    """Expose a classification-only diagnostic; it never creates or runs tasks."""
     runtime = request.app.state.runtime
     if looks_like_secret(body.message):
         raise HTTPException(
@@ -134,9 +172,12 @@ def classify_request(body: AssistantRequest, request: Request) -> AssistantInten
         if parse_explicit_local_file_request(body.message) is not None:
             return AssistantIntent(category=AssistantIntentCategory.ACTION_EXECUTION, current_turn_authorizes_execution=True)
         if _looks_like_file_action(body.message):
+            record, clarification = _uploaded_document_selection(runtime, body.message)
+            if record is not None:
+                return AssistantIntent(category=AssistantIntentCategory.ACTION_EXECUTION, current_turn_authorizes_execution=True)
             return AssistantIntent(
                 category=AssistantIntentCategory.CLARIFICATION_REQUIRED,
-                clarification_question="Please provide one exact absolute Windows path to a PDF, DOCX, or TXT file that you want UNBOUND to read.",
+                clarification_question=clarification or "Upload the document you want UNBOUND to analyze.",
             )
         timezone_name = runtime.user_timezone
         if parse_reminder_command(body.message, timezone_name) is not None or (
@@ -186,7 +227,8 @@ async def handle_assistant_request(body: AssistantRequest, request: Request) -> 
         raise HTTPException(status_code=404, detail={"code": "conversation_not_found", "message": "Conversation session was not found"})
 
     try:
-        if body.session_id is not None:
+        is_uploaded_document_request = _looks_like_file_action(body.message) and parse_explicit_local_file_request(body.message) is None
+        if body.session_id is not None and not is_uploaded_document_request:
             task_context = resolve_document_followup(runtime, body.session_id, body.message)
             if task_context is not None:
                 if task_context["status"] in {"ambiguous", "unavailable"}:
@@ -210,6 +252,10 @@ async def handle_assistant_request(body: AssistantRequest, request: Request) -> 
                     AssistantIntent(category=AssistantIntentCategory.INFORMATION),
                     reply,
                 )
+    except LLMConfigurationError as exc:
+        raise HTTPException(status_code=503, detail={"code": "llm_unavailable", "message": "LLM provider is not configured"}) from exc
+    except LLMProviderError as exc:
+        raise HTTPException(status_code=503, detail={"code": "llm_provider_error", "message": exc.public_message}) from exc
     except (ConversationStoreError, MemoryStoreError) as exc:
         logger.error("Task context lookup failed: exception_class=%s", type(exc.__cause__ or exc).__name__)
         raise HTTPException(status_code=500, detail={"code": "assistant_context_unavailable", "message": "Assistant context is unavailable"}) from exc
@@ -290,11 +336,54 @@ async def handle_assistant_request(body: AssistantRequest, request: Request) -> 
     # A clear file action with a Windows drive prefix but no single supported
     # path is a clarification, never a fallthrough to generic planning.
     if _looks_like_file_action(body.message):
-        clarification = AssistantIntent(
-            category=AssistantIntentCategory.CLARIFICATION_REQUIRED,
-            clarification_question="Please provide one exact absolute Windows path to a PDF, DOCX, or TXT file that you want UNBOUND to read.",
+        record, clarification_text = _uploaded_document_selection(runtime, body.message)
+        if record is None:
+            clarification = AssistantIntent(
+                category=AssistantIntentCategory.CLARIFICATION_REQUIRED,
+                clarification_question=clarification_text or "Upload the document you want UNBOUND to analyze.",
+            )
+            return _assistant_response(runtime, body, clarification, clarification.clarification_question)
+        tool_name = "document.analyze_uploaded"
+        if not any(tool.tool_name == tool_name for tool in runtime.registry.list_tools()):
+            intent = AssistantIntent(category=AssistantIntentCategory.ACTION_EXECUTION, current_turn_authorizes_execution=True)
+            return _assistant_response(runtime, body, intent, "Uploaded document analysis is unavailable in this runtime. No analysis was performed.")
+        task_request = TaskCreateRequest(user_request=body.message, auto_execute=False)
+        task = runtime.manager.create(task_request, [_uploaded_analysis_step(record, body.message)])
+        reply = (
+            f"Plan ready to analyze the uploaded document {record.original_filename}. "
+            "Review the plan and select Run plan to start the local, evidence-grounded analysis. No analysis has run yet."
         )
-        return _assistant_response(runtime, body, clarification, clarification.clarification_question)
+        return _assistant_response(
+            runtime, body,
+            AssistantIntent(category=AssistantIntentCategory.ACTION_EXECUTION, current_turn_authorizes_execution=True),
+            reply,
+            task,
+        )
+
+    public_research_request = is_public_web_research_request(body.message)
+    registered_tool_inventory = _tool_inventory(runtime)
+    public_search_tools = public_web_search_tool_names(registered_tool_inventory)
+    if public_research_request and not public_search_tools:
+        tool_names = {item["tool_name"] for item in registered_tool_inventory}
+        capabilities = []
+        if "document.search" in tool_names:
+            capabilities.append("document.search searches only locally indexed documents")
+        if "browser.navigate" in tool_names:
+            capabilities.append("browser.navigate can visit a URL you provide, subject to its host allowlist")
+        available = "; ".join(capabilities) or "no public-search capability is registered"
+        reply = (
+            "Public web research is unavailable in this runtime: " + available + ". "
+            "No public search was performed and no sources were generated."
+        )
+        return _assistant_response(
+            runtime,
+            body,
+            AssistantIntent(
+                category=AssistantIntentCategory.ACTION_EXECUTION,
+                current_turn_authorizes_execution=True,
+            ),
+            reply,
+        )
 
     try:
         history: list[dict[str, str]] = []
@@ -333,17 +422,36 @@ async def handle_assistant_request(body: AssistantRequest, request: Request) -> 
 
         task_request = TaskCreateRequest(user_request=body.message, auto_execute=False)
         plan = generate_plan(task_request, runtime.registry, provider)
+        if public_research_request:
+            planned_tools = {step.tool_name for step in plan.steps}
+            local_search_tools = planned_tools.intersection({"document.search", "context.retrieve", "context.relate"})
+            if local_search_tools or not planned_tools.intersection(public_search_tools):
+                reply = (
+                    "I couldn't prepare public web research because the generated plan did not use a registered public web-search tool. "
+                    "Local document search is not a web search. No research task was created."
+                )
+                return _assistant_response(
+                    runtime,
+                    body,
+                    AssistantIntent(
+                        category=AssistantIntentCategory.ACTION_EXECUTION,
+                        current_turn_authorizes_execution=True,
+                    ),
+                    reply,
+                )
         if plan.missing_information:
             question = intent.clarification_question or f"Please clarify: {plan.missing_information[0]}"
             clarification_response = _clarification_response(intent, question)
             return _assistant_response(runtime, body, clarification_response.intent, clarification_response.reply)
-        task = runtime.manager.create(task_request, plan.steps)
+        domain_policy = runtime.browserless_domain_review_policy(body.message, plan.steps)
+        task = runtime.manager.create(task_request, plan.steps, browser_domain_policy=domain_policy)
+        runtime.record_browserless_domain_review(task)
         approval_steps = [step.step_id for step in task.plan if step.requires_approval]
         step_summary = "; ".join(f"{step.step_id}: {step.description}" for step in task.plan)
         reply = f"Task plan {task.task_id} is ready. Nothing has been executed. Steps: {step_summary}."
         if approval_steps:
             reply += f" Approval will be required for step(s): {', '.join(approval_steps)}."
-        reply += f" To proceed, explicitly call POST /api/tasks/{task.task_id}/execute."
+        reply += " Review the plan below and select Run plan to start it."
         return _assistant_response(runtime, body, intent, reply, task)
     except HTTPException:
         raise

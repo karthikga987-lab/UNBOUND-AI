@@ -11,11 +11,20 @@ from backend.app.conversation.store import SQLiteConversationStore
 from backend.app.main import create_app
 from backend.app.orchestrator.intent import TaskIntent
 from backend.app.llm.provider import LLMProviderError
-from backend.app.schemas.contracts import TaskStep, ToolDefinition
+from backend.app.schemas.contracts import TaskStep, ToolDefinition, ToolResult
+from backend.app.assistant.intent import (
+    classify_assistant_intent,
+    is_public_web_research_request,
+    public_web_search_tool_names,
+)
 
 
 class SearchInput(BaseModel):
     query: str
+
+
+class BrowserNavigateInput(BaseModel):
+    url: str
 
 
 def classification(category: str, **values):
@@ -54,8 +63,8 @@ class IntentProvider:
             return response_model.model_validate(self.intent)
         if response_model is TaskIntent:
             return response_model(
-                goal="Search synthetic project documents",
-                required_capabilities=["document.search"],
+                goal="Perform the requested browser research",
+                required_capabilities=[step.tool_name for step in self.plan_steps],
                 sensitive_actions=[],
                 missing_information=self.task_missing_information,
             )
@@ -246,3 +255,232 @@ def test_unavailable_tools_are_reported_without_fabricating_a_plan(tmp_path):
     assert "no tools are currently registered" in response.json()["reply"].lower()
     assert runtime.manager.repository._tasks == {}
     assert executions == []
+
+
+def test_public_research_is_not_routed_to_local_document_search(tmp_path):
+    class NoModelNeededProvider(IntentProvider):
+        def generate_json(self, *, system, prompt, response_model, **kwargs):
+            raise AssertionError("Unavailable public search must be reported before LLM planning")
+
+    provider = NoModelNeededProvider()
+    client, runtime, executions = make_client(tmp_path, provider)
+
+    response = client.post(
+        "/api/assistant/requests",
+        json={"message": "Research the latest developments in AI agents and cite credible public sources."},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["task"] is None
+    assert body["intent"]["category"] == "action_execution"
+    assert "document.search searches only locally indexed documents" in body["reply"]
+    assert "No public search was performed" in body["reply"]
+    assert "sources were generated" in body["reply"]
+    assert runtime.manager.repository._tasks == {}
+    assert provider.calls == []
+    assert executions == []
+
+
+@pytest.mark.parametrize("message", [
+    "Search my project documents for the release plan.",
+    "Search the report for the budget section.",
+])
+def test_local_document_search_is_not_misclassified_as_public_research(message):
+    assert not is_public_web_research_request(message)
+
+
+def test_direct_url_page_analysis_is_not_misclassified_as_web_discovery():
+    assert not is_public_web_research_request(
+        "Search the web and inspect https://example.com/research."
+    )
+
+
+def test_public_search_tool_detection_uses_actual_registered_metadata():
+    assert public_web_search_tool_names([
+        {"tool_name": "document.search", "description": "Search indexed documents"},
+        {"tool_name": "browser.navigate", "description": "Navigate to an allowlisted URL"},
+        {"tool_name": "web.search", "description": "Search the public web"},
+    ]) == {"web.search"}
+
+
+def test_public_research_intent_is_deterministic_and_does_not_call_model():
+    class NoModelNeededProvider(IntentProvider):
+        def generate_json(self, *, system, prompt, response_model, **kwargs):
+            raise AssertionError("Clear public-research intent must not depend on an LLM guess")
+
+    intent = classify_assistant_intent(
+        "Research the latest developments in AI agents and cite credible sources.",
+        NoModelNeededProvider(),
+        registered_tools=[{"tool_name": "document.search", "description": "Search indexed documents"}],
+    )
+
+    assert intent.category == "action_execution"
+    assert intent.current_turn_authorizes_execution is True
+
+
+def test_direct_browser_research_prepares_plan_and_run_plan_executes_saved_parameters(tmp_path):
+    url = "https://example.com/research"
+    provider = IntentProvider(plan_steps=[TaskStep(
+        step_id="open_research_source",
+        tool_name="browser.navigate",
+        description="Open the approved research source",
+        input={"url": url},
+        expected_outcome="The requested page is observed",
+    )])
+    store = SQLiteConversationStore(tmp_path / "browser-research.sqlite3")
+    runtime = TaskRuntime(provider=provider, conversation_store=store)
+    calls = []
+    runtime.register_tool(
+        ToolDefinition(
+            tool_name="browser.navigate",
+            description="BROWSERLESS CLOUD DEMO: navigate to exact allowlisted HTTPS hosts only.",
+            input_schema=BrowserNavigateInput.model_json_schema(),
+        ),
+        BrowserNavigateInput,
+        lambda arguments, call: calls.append(call) or ToolResult(success=True, data={"url": arguments.url}),
+        verifier=lambda tool, expected, result: result.success and result.data["url"] == url,
+    )
+    client = TestClient(create_app(runtime))
+
+    prepared = client.post("/api/assistant/requests", json={"message": f"Search the web and inspect {url}."})
+
+    assert prepared.status_code == 200, prepared.text
+    body = prepared.json()
+    assert body["intent"]["category"] == "action_execution"
+    assert body["task"]["status"] == "created"
+    assert body["task"]["plan"][0]["input"] == {"url": url}
+    assert "select Run plan" in body["reply"]
+    assert calls == []
+
+    executed = client.post(f"/api/tasks/{body['task']['task_id']}/execute")
+
+    assert executed.status_code == 200, executed.text
+    assert executed.json()["status"] == "completed", json.dumps(executed.json(), indent=2)
+    assert len(calls) == 1
+    assert calls[0].arguments == {"url": url}
+
+
+def test_explicit_readonly_https_request_does_not_turn_extraction_outputs_into_clarification(tmp_path):
+    class NoModelNeededProvider(IntentProvider):
+        def generate_json(self, *, system, prompt, response_model, **kwargs):
+            self.calls.append({"model": response_model.__name__})
+            raise AssertionError("Explicit read-only HTTPS navigation should not ask the model for output fields")
+
+    url = "https://example.com"
+    provider = NoModelNeededProvider()
+    runtime = TaskRuntime(provider=provider, conversation_store=SQLiteConversationStore(tmp_path / "direct-page.sqlite3"))
+    calls = []
+    runtime.register_tool(
+        ToolDefinition(
+            tool_name="browser.navigate",
+            description="BROWSERLESS CLOUD DEMO: exact-host HTTPS navigation only.",
+            input_schema=BrowserNavigateInput.model_json_schema(),
+        ),
+        BrowserNavigateInput,
+        lambda arguments, call: calls.append(call) or ToolResult(success=True, data={"url": str(arguments.url)}),
+        verifier=lambda _tool, _expected, result: result.success and result.data["url"] == f"{url}/",
+    )
+    client = TestClient(create_app(runtime))
+
+    prepared = client.post("/api/assistant/requests", json={
+        "message": "Open https://example.com, extract its page title and main visible text, and capture a screenshot."
+    })
+
+    assert prepared.status_code == 200, prepared.text
+    body = prepared.json()
+    assert body["task"]["status"] == "created"
+    assert body["task"]["plan"][0]["tool_name"] == "browser.navigate"
+    assert body["task"]["plan"][0]["input"] == {"url": url}
+    assert "select Run plan" in body["reply"]
+    assert calls == []
+    assert provider.calls == []
+
+
+def test_uploaded_document_request_selects_managed_upload_and_prepares_read_only_plan(tmp_path):
+    from backend.app.documents.extractor import extract_document
+    from backend.app.documents.local_file import LocalDocumentAnalysis
+    from backend.app.documents.store import DocumentStore
+
+    class UploadedProvider(IntentProvider):
+        base_url = "http://127.0.0.1:11434/v1"
+
+        def generate_json(self, *, system, prompt, response_model, **kwargs):
+            if response_model is LocalDocumentAnalysis:
+                payload = json.loads(prompt)
+                span = payload["source_spans"][0]
+                return response_model.model_validate({
+                    "summary": "The report says delivery is planned for June.",
+                    "findings": [{
+                        "kind": "fact",
+                        "statement": "Delivery is planned for June.",
+                        "source_chunk_id": span["chunk_id"],
+                        "source_span_id": span["source_span_id"],
+                    }],
+                    "missing_or_unreadable": [],
+                })
+            return super().generate_json(system=system, prompt=prompt, response_model=response_model, **kwargs)
+
+        def generate_text(self, *, system, prompt, **kwargs):
+            return "The uploaded report states that delivery is planned for June."
+
+    provider = UploadedProvider()
+    runtime = TaskRuntime(
+        provider=provider,
+        conversation_store=SQLiteConversationStore(tmp_path / "uploaded.sqlite3"),
+        document_store=DocumentStore(tmp_path / "documents"),
+    )
+    runtime.register_document_tools()
+    source = b"Synthetic report: delivery is planned for June."
+    document_id_value = "de9a2ef0-20eb-4280-9b77-979a5d148e3e"
+    extraction = extract_document(source, document_id_value, "brief.txt")
+    document_id, stored_name, stored_path = runtime.document_store.save_file(
+        source, "brief.txt", document_id=document_id_value
+    )
+    runtime.document_store.save_extraction(
+        document_id, "brief.txt", stored_name, stored_path, extraction
+    )
+    client = TestClient(create_app(runtime))
+
+    session_id = client.post("/api/conversations").json()["session_id"]
+    response = client.post("/api/assistant/requests", json={"message": "Analyze this document.", "session_id": session_id})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["task"]["status"] == "created"
+    assert body["task"]["plan"][0]["tool_name"] == "document.analyze_uploaded"
+    assert body["task"]["plan"][0]["input"]["document_id"] == document_id
+    assert body["task"]["plan"][0]["requires_approval"] is False
+    assert "No analysis has run yet" in body["reply"]
+
+    executed = client.post(f"/api/tasks/{body['task']['task_id']}/execute")
+    assert executed.status_code == 200, executed.text
+    assert executed.json()["status"] == "completed", json.dumps(executed.json(), indent=2)
+    assert executed.json()["evidence"][0]["excerpt"] == "Synthetic report: delivery is planned for June."
+
+    followup = client.post("/api/assistant/requests", json={
+        "message": "What are the report findings?", "session_id": session_id,
+    })
+    assert followup.status_code == 200, followup.text
+    assert "planned for june" in followup.json()["reply"].lower()
+    assert "verified source" in followup.json()["reply"].lower()
+
+
+def test_uploaded_document_request_without_upload_does_not_claim_to_have_read_a_file(tmp_path):
+    from backend.app.documents.store import DocumentStore
+
+    runtime = TaskRuntime(
+        provider=IntentProvider(),
+        conversation_store=SQLiteConversationStore(tmp_path / "no-upload.sqlite3"),
+        document_store=DocumentStore(tmp_path / "empty-documents"),
+    )
+    runtime.register_document_tools()
+    client = TestClient(create_app(runtime))
+
+    response = client.post("/api/assistant/requests", json={"message": "Analyze this document."})
+
+    assert response.status_code == 200
+    assert response.json()["task"] is None
+    assert response.json()["intent"]["category"] == "clarification_required"
+    assert "upload" in response.json()["reply"].lower()
+    assert "no file was opened" in response.json()["reply"].lower()

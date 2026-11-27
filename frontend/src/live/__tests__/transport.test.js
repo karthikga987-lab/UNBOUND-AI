@@ -52,7 +52,7 @@ describe('openLiveConnection (websocket)', () => {
   it('connects, delivers events and reports status', () => {
     const { statuses, received } = connect()
     const socket = FakeSocket.instances[0]
-    expect(socket.url).toBe('/api/browser/sessions/task-1/events?after=')
+    expect(socket.url).toBe('/api/browser/sessions/task-1/events?after=0')
     socket.open()
     socket.send([event('a', 1), event('b', 2)])
     socket.send({ events: [event('c', 3)] })
@@ -119,6 +119,7 @@ describe('openLiveConnection (polling)', () => {
     const conn = openLiveConnection({ transport: 'polling', url: '/x/{task_id}?after={after}', taskId: 't', pollMs: 10, onEvents: () => {}, onStatus: (s) => statuses.push(s), deps: { fetch } })
     await vi.advanceTimersByTimeAsync(0)
     expect(fetch).toHaveBeenCalledTimes(1)
+    expect(fetch.mock.calls[0][0]).toBe('/x/t?after=0')
     await vi.advanceTimersByTimeAsync(500)
     expect(fetch).toHaveBeenCalledTimes(1)
     await vi.advanceTimersByTimeAsync(600)
@@ -128,6 +129,15 @@ describe('openLiveConnection (polling)', () => {
     conn.close()
   })
 
+  it('treats cancellation as terminal and stops polling', async () => {
+    const fetch = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ events: [event('cancelled', 1, 'cancelled')] }) })
+    const statuses = []
+    const conn = openLiveConnection({ transport: 'polling', url: '/x/{task_id}?after={after}', taskId: 't', onEvents: () => {}, onStatus: (s) => statuses.push(s), deps: { fetch } })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(statuses.at(-1)).toBe(ConnectionStatus.ENDED)
+    expect(fetch).toHaveBeenCalledTimes(1)
+    conn.close()
+  })
   it('reports reconnecting when a poll fails', async () => {
     const fetch = vi.fn().mockResolvedValue({ ok: false, status: 502 })
     const statuses = []
@@ -139,12 +149,21 @@ describe('openLiveConnection (polling)', () => {
 })
 
 describe('browserSessionService', () => {
-  it('reports every capability as unavailable when nothing is configured (current backend)', () => {
-    const service = createBrowserSessionService(getLiveConfig({}))
-    expect(service.capabilities).toEqual({ liveEvents: false, pause: false, resume: false })
+  it('uses the task-scoped backend polling endpoint by default', () => {
+    const config = getLiveConfig({})
+    const fetch = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ events: [] }) })
+    const service = createBrowserSessionService(config, { fetch })
+    expect(config).toMatchObject({ transport: 'polling', eventsUrl: '/api/tasks/{task_id}/browser-events?after={after}' })
+    expect(service.capabilities).toEqual({ liveEvents: true, pause: false, resume: false })
     const statuses = []
-    service.connect('t', { onEvents: () => {}, onStatus: (s) => statuses.push(s) })
-    expect(statuses).toEqual([ConnectionStatus.UNAVAILABLE])
+    const connection = service.connect('t', { onEvents: () => {}, onStatus: (s) => statuses.push(s) })
+    expect(statuses).toEqual([ConnectionStatus.CONNECTING])
+    connection.close()
+  })
+
+  it('allows live polling to be explicitly disabled', () => {
+    const service = createBrowserSessionService(getLiveConfig({ VITE_LIVE_TRANSPORT: 'none' }))
+    expect(service.capabilities.liveEvents).toBe(false)
   })
 
   it('rejects pause/resume instead of pretending they worked', async () => {

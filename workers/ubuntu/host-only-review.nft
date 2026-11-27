@@ -1,0 +1,26 @@
+# Review on the isolated guest console. No installer applies this file.
+# This is a default-deny guest policy for the dedicated VM. Validate the
+# interface/address and ensure the table does not already exist before loading.
+define dev = "enp0s3"
+define host = 192.168.56.1
+define guest = 192.168.56.10
+table inet unbound_guest {
+    chain input {
+        type filter hook input priority filter; policy drop;
+        iifname "lo" counter accept
+        iifname $dev ip saddr $host ip daddr $guest tcp dport 9443 ct state new,established counter accept
+        iifname $dev ip saddr $host ip daddr $guest tcp sport 18765 ct state established ct direction reply counter accept
+        counter drop
+    }
+    chain output {
+        type filter hook output priority filter; policy drop;
+        oifname "lo" counter accept
+        oifname $dev ip saddr $guest ip daddr $host tcp dport 18765 ct state new,established counter accept
+        oifname $dev ip saddr $guest ip daddr $host tcp sport 9443 ct state established ct direction reply counter accept
+        counter drop
+    }
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+        counter drop
+    }
+}

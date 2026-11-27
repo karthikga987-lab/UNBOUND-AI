@@ -1,0 +1,5 @@
+# Reference versions for the offline worker package; install only in a future
+# isolated guest after reviewing docs/UBUNTU_BROWSER_WORKER.md.
+playwright==1.65.2
+cryptography==50.0.2
+pydantic==2.14.4

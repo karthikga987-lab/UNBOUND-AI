@@ -1,8 +1,10 @@
-# Live View: proposed browser event contract (v1.0)
+# Live View browser event contract (v1.0)
 
-**Status: PROPOSAL.** No backend implements this yet. The frontend Live View is built against it and shows an explicit
-"Live view is not available yet" state until a real browser backend is connected. Member 2 (browser engine) owns the
-server side; this document describes what the frontend can consume so it never needs a rewrite.
+**Status: PARTIALLY IMPLEMENTED.** The FastAPI backend exposes task-scoped polling at
+`GET /api/tasks/{task_id}/browser-events?after={sequence}` and publishes bounded events through
+`BrowserLiveEventStore`. Current events may include a sanitized URL, page title, provider name, and the latest bounded
+PNG screenshot as base64 with a SHA-256 hash. This document retains the fuller v1.0 shape for compatible extensions;
+cursor/target/input overlays, WebSocket/SSE delivery, and pause/resume controls are not currently implemented.
 
 Nothing in the frontend hardcodes these endpoints. Every URL is provided through `frontend/.env.local` (see the end of this document).
 
@@ -18,10 +20,11 @@ Nothing in the frontend hardcodes these endpoints. Every URL is provided through
 Approvals, cancellation, execution and safety stay entirely in the orchestrator. The frontend never approves,
 executes or marks anything complete on its own.
 
-## What is missing (to be provided by the browser backend)
+## Current limits
 
-1. A **live event stream** per task: WebSocket (preferred), Server-Sent Events, or a JSON polling endpoint.
-2. Optional **pause** and **resume** endpoints. Until they exist, those buttons stay disabled.
+The current transport is JSON polling. Optional **pause** and **resume** endpoints are not implemented and their
+controls stay disabled. Events are transient and bounded in memory; reconnect can retrieve only events retained for
+the current backend process.
 
 ## Event shape
 
@@ -120,9 +123,9 @@ resume as done until the backend confirms it.
 4. Check: frames appear, the cursor/click/typing overlays line up with the page, the activity feed is in order,
    pulling the network briefly shows Reconnecting and then recovers, and Stop ends in **Cancelled** only once the task API says so.
 
-## Verification levels (current state)
+## Verification levels (implementation status)
 
-1. Frontend interface completed: **yes**.
-2. Mocked frontend tests passed: **yes** (`npm test`).
-3. Actual browser backend integration: **no**, there is no browser backend yet.
-4. Real-time computer view verified against a real browser: **no**.
+1. Frontend interface and task-scoped polling client: **implemented**.
+2. Event store, polling route, transport, and component behavior: **covered by automated tests**.
+3. Browser provider integration: **implemented for configured providers; provider-specific runtime status is reported separately**.
+4. Independent OS-level network containment: **not established by this Live View contract or its tests**.

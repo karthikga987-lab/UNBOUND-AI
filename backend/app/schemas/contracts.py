@@ -40,6 +40,14 @@ class TaskStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class BrowserDomainAuthorizationStatus(StrEnum):
+    NOT_APPLICABLE = "not_applicable"
+    AWAITING_RUN_PLAN = "awaiting_run_plan"
+    GRANTED = "granted"
+    DENIED = "denied"
+    EXPIRED = "expired"
+
+
 class StepStatus(StrEnum):
     PENDING = "pending"
     RUNNING = "running"
@@ -137,6 +145,14 @@ class ExecutionEvent(ContractModel):
     status: EventStatus
     timestamp: UTCDateTime = Field(default_factory=utc_now)
     evidence_ids: list[UUID4] = Field(default_factory=list)
+    tool_name: str | None = Field(default=None, max_length=120)
+    browser_session_id: str | None = Field(default=None, max_length=120)
+    provider_session_id: str | None = Field(default=None, max_length=160)
+    duration_ms: int | None = Field(default=None, ge=0, le=86_400_000)
+    result_count: int | None = Field(default=None, ge=0, le=1_000_000)
+    screenshot_reference: str | None = Field(default=None, max_length=200)
+    error_category: str | None = Field(default=None, max_length=100)
+    diagnostic: dict[str, Any] | None = None
 
 
 class TaskResponse(ContractModel):
@@ -152,6 +168,14 @@ class TaskResponse(ContractModel):
     artifacts: list[dict[str, Any]] = Field(default_factory=list)
     result: dict[str, Any] | None = None
     error: str | None = None
+    # Browserless permissions are task-scoped. These lists are an audit record;
+    # runtime dispatch additionally requires a live task, active step, and live
+    # task browser session before honoring the grant.
+    baseline_browser_domains: list[str] = Field(default_factory=list)
+    requested_browser_domains: list[str] = Field(default_factory=list)
+    authorized_browser_domains: list[str] = Field(default_factory=list)
+    browser_domain_authorization_status: BrowserDomainAuthorizationStatus = BrowserDomainAuthorizationStatus.NOT_APPLICABLE
+    browser_domain_authorized_at: UTCDateTime | None = None
     created_at: UTCDateTime = Field(default_factory=utc_now)
     updated_at: UTCDateTime = Field(default_factory=utc_now)
 

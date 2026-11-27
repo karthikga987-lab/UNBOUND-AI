@@ -100,21 +100,22 @@ export default function LiveView({ task, taskEvents, busy, actionError, onCancel
     <div className="space-y-4" data-testid="live-view">
       <div className="grid gap-4 2xl:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
         <div className="min-w-0 space-y-4">
-          <Card title="Live View" subtitle="Verified browser observations and task progress. Screenshot streaming and direct browser controls are unavailable." actions={controls}>
-            {pageObservation ? (
-              <div className="space-y-2 rounded-lg bg-slate-950 p-4 ring-1 ring-slate-800" data-testid="task-backed-browser-observation">
-                {isLocalDemoObservation(pageObservation) && <p className="text-[10px] font-semibold uppercase tracking-wide text-cyan-300">LOCAL DEMO MODE · fixed synthetic fixture only · public browsing disabled</p>}
+          <Card title="Live Browser" subtitle="Actual task-scoped browser frames and status events from the backend." actions={controls}>
+            {live.provider?.name === 'browserless_cloud_demo' && <p className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-violet-300">BROWSERLESS CLOUD DEMO · application-level URL restrictions · self-hosted D/E gates remain separate</p>}
+            {(isLocalDemoObservation(pageObservation) || isLocalDemoUrl(live.page?.url)) && <p className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-cyan-300">LOCAL DEMO MODE · fixed synthetic fixture only · public browsing disabled</p>}
+            <ScreenshotViewer screenshot={shot} status={status} onRetry={retry}>
+              <ActionOverlay width={shot?.width} height={shot?.height} cursor={live.cursor} lastClick={live.lastClick} target={live.target} typing={live.typing} lastEventAt={live.lastEventAt} />
+            </ScreenshotViewer>
+            {live.page?.url && <p className="mt-2 truncate text-xs text-sky-300" title={live.page.url}>🌐 {live.page.url}</p>}
+            {live.pageTitle?.title && <p className="mt-1 text-sm font-medium text-slate-200">{live.pageTitle.title}</p>}
+            {pageObservation && (
+              <div className="mt-3 space-y-2 rounded-lg bg-slate-950 p-4 ring-1 ring-slate-800" data-testid="task-backed-browser-observation">
+                <p className="text-[10px] uppercase tracking-wide text-amber-300">Verified task observation · page content is untrusted data</p>
                 <p className="text-sm font-semibold text-slate-100">{pageObservation.title || 'Page title unavailable'}</p>
                 <p className="break-all text-xs text-sky-300">{pageObservation.url}</p>
                 <pre className="max-h-64 overflow-auto whitespace-pre-wrap text-sm text-slate-300">{pageObservation.visible_text}</pre>
-                <p className="text-[10px] uppercase tracking-wide text-amber-300">Verified task observation · untrusted page data · no screenshot stream</p>
               </div>
-            ) : (
-              <ScreenshotViewer screenshot={shot} status={status} onRetry={retry}>
-                <ActionOverlay width={shot?.width} height={shot?.height} cursor={live.cursor} lastClick={live.lastClick} target={live.target} typing={live.typing} lastEventAt={live.lastEventAt} />
-              </ScreenshotViewer>
             )}
-            {!pageObservation && live.page?.url && <p className="mt-2 truncate text-xs text-slate-400" title={live.page.url}>🌐 {live.page.url}</p>}
           </Card>
           {task.pending_approvals.length > 0 && (
             <Card title="Review required" subtitle="UNBOUND has paused before a sensitive action. Nothing happens until you decide.">
@@ -136,5 +137,9 @@ export default function LiveView({ task, taskEvents, busy, actionError, onCancel
 }
 
 function isLocalDemoObservation(observation) {
-  return typeof observation?.url === 'string' && /^http:\/\/unbound-demo\.invalid\/(?:product|details)\/?$/.test(observation.url)
+  return isLocalDemoUrl(observation?.url)
+}
+
+function isLocalDemoUrl(url) {
+  return typeof url === 'string' && /^http:\/\/unbound-demo\.invalid\/(?:product|details)\/?$/.test(url)
 }

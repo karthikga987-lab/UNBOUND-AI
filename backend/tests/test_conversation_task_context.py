@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+from uuid import UUID
 
 from fastapi.testclient import TestClient
 
 from backend.app.api.runtime import TaskRuntime
+from backend.app.assistant.task_context import resolve_document_followup
 from backend.app.conversation.store import SQLiteConversationStore
+from backend.app.llm.provider import LLMProviderError
 from backend.app.main import create_app
 from backend.app.schemas.contracts import (
     EvidenceItem, EvidenceSourceType, TaskCreateRequest, TaskStatus, TaskStep,
@@ -219,6 +222,36 @@ def test_document_followup_without_any_task_remains_ordinary_conversation(tmp_pa
     assert response.status_code == 200
     assert json.loads(provider.prompt)["previous_verified_document_task"] is None
     assert runtime.manager.repository._tasks == {}
+
+
+def test_browser_evidence_request_does_not_attach_prior_document_context(tmp_path):
+    runtime = make_runtime(tmp_path)
+    client = TestClient(create_app(runtime))
+    session_id = client.post("/api/conversations").json()["session_id"]
+    add_verified_document_task(runtime, session_id, "prior.txt", "Prior local document evidence.")
+
+    message = (
+        "Using Browserless Cloud, open https://example.org/. Extract the page title, "
+        "capture a screenshot, and save and verify the browser evidence."
+    )
+    assert resolve_document_followup(runtime, UUID(session_id), message) is None
+
+
+def test_document_followup_provider_error_returns_sanitized_503(tmp_path):
+    class FailingProvider(CapturingProvider):
+        def generate_text(self, *, system, prompt, **kwargs):
+            raise LLMProviderError("private provider details", public_message="Safe local model error.")
+
+    runtime = make_runtime(tmp_path, provider=FailingProvider())
+    client = TestClient(create_app(runtime))
+    session_id = client.post("/api/conversations").json()["session_id"]
+    add_verified_document_task(runtime, session_id, "prior.txt", "Prior local document evidence.")
+
+    response = client.post("/api/assistant/requests", json={"message": FOLLOW_UP, "session_id": session_id})
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == {"code": "llm_provider_error", "message": "Safe local model error."}
+    assert "private provider details" not in response.text
 
 
 def test_task_link_persists_atomically_with_exchange_and_conflicting_retry_does_not_link(tmp_path):

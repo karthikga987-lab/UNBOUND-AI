@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from enum import StrEnum
 from typing import Any
 
@@ -80,7 +81,103 @@ conversation. A request to plan is not a request to execute. "Move these files
 into Documents" is an execution request when stated as the current request.
 Never select tools, generate code, or claim that an action occurred. The
 separate planner extracts parameters, identifies sensitive actions, and uses
-only registered tools."""
+only registered tools. A clear current-turn instruction to perform browser
+research or read/summarize a webpage is actionable when browser.navigate is
+registered. Do not ask whether the user wants the requested task or whether it
+should be planned. The backend prepares a reviewable plan only; it does not run
+the browser until the user selects Run plan. Ask only for a parameter the
+registered tool genuinely requires and cannot safely infer."""
+
+
+_BROWSER_ACTION = re.compile(
+    r"\b(?:search|research|browse|look\s+up|find|visit|open|navigate|read|"
+    r"summari[sz]e|analy[sz]e|extract)\b",
+    re.IGNORECASE,
+)
+_BROWSER_TARGET = re.compile(
+    r"\b(?:web|online|internet|website|webpage|web\s+page|page|site)\b|https?://",
+    re.IGNORECASE,
+)
+_QUESTION_ONLY = re.compile(r"^\s*(?:how|what|why|when|where|who)\b", re.IGNORECASE)
+_LOCAL_SEARCH_SCOPE = re.compile(
+    r"\b(?:my|local|uploaded|indexed|stored|project|attached|these)\s+"
+    r"(?:documents?|files?|reports?|records?|knowledge\s+base)\b|"
+    r"\b(?:document|file|report|knowledge\s+base)\s+search\b|"
+    r"\bsearch\s+(?:the\s+)?(?:document|file|report)\b",
+    re.IGNORECASE,
+)
+_EXPLICIT_SOURCE_URL = re.compile(r"https?://[^\s\])}>]+", re.IGNORECASE)
+_DIRECT_PAGE_ACTION = re.compile(
+    r"\b(?:open|visit|navigate\s+to|inspect|read|summari[sz]e|analy[sz]e|extract)\b",
+    re.IGNORECASE,
+)
+_PUBLIC_RESEARCH_SIGNAL = re.compile(
+    r"\b(?:research|web\s+search|search\s+(?:the\s+)?(?:public\s+)?(?:web|internet|online)|"
+    r"internet\s+search|look\s+up|latest|recent|current|credible\s+sources?|"
+    r"public\s+sources?|news|trends|developments)\b",
+    re.IGNORECASE,
+)
+
+
+def is_public_web_research_request(message: str) -> bool:
+    """Identify public-source discovery requests without confusing them with local search.
+
+    A supplied URL plus an explicit page action is a page-analysis request and
+    remains eligible for the existing URL/host allowlist path. Public research
+    without a known source requires a genuinely registered web-search tool.
+    """
+    text = message.strip()
+    if not text or _LOCAL_SEARCH_SCOPE.search(text):
+        return False
+    if _EXPLICIT_SOURCE_URL.search(text) and _DIRECT_PAGE_ACTION.search(text):
+        return False
+    return bool(_PUBLIC_RESEARCH_SIGNAL.search(text))
+
+
+def public_web_search_tool_names(registered_tools: list[dict[str, Any]] | None) -> set[str]:
+    """Return only registered tools whose metadata explicitly describes public web search."""
+    result: set[str] = set()
+    for item in registered_tools or []:
+        name = str(item.get("tool_name", "")).casefold()
+        description = str(item.get("description", "")).casefold()
+        if not name or name.startswith(("document.", "context.")):
+            continue
+        named_as_web_search = "search" in name and any(
+            marker in name for marker in ("web", "internet", "public")
+        )
+        described_as_web_search = any(
+            phrase in description
+            for phrase in (
+                "public web search",
+                "search the public web",
+                "search the public internet",
+                "search public websites",
+                "search public sources",
+                "internet search",
+                "web search engine",
+            )
+        )
+        if named_as_web_search or described_as_web_search:
+            result.add(str(item.get("tool_name")))
+    return result
+
+
+def _clearly_requests_browser_action(
+    message: str,
+    registered_tools: list[dict[str, Any]] | None,
+) -> bool:
+    """Recognize direct browser requests without asking an LLM to infer intent.
+
+    This only prepares a plan. URL allowlists and tool input validation remain
+    enforced by the registered browser tool and planner.
+    """
+    tool_names = {str(item.get("tool_name", "")) for item in (registered_tools or [])}
+    if "browser.navigate" not in tool_names:
+        return False
+    text = message.strip()
+    if not text or _QUESTION_ONLY.search(text):
+        return False
+    return bool(_BROWSER_ACTION.search(text) and _BROWSER_TARGET.search(text))
 
 
 def classify_assistant_intent(
@@ -92,6 +189,16 @@ def classify_assistant_intent(
 ) -> AssistantIntent:
     if not message.strip():
         raise ValueError("User message must not be empty")
+    if is_public_web_research_request(message):
+        return AssistantIntent(
+            category=AssistantIntentCategory.ACTION_EXECUTION,
+            current_turn_authorizes_execution=True,
+        )
+    if _clearly_requests_browser_action(message, registered_tools):
+        return AssistantIntent(
+            category=AssistantIntentCategory.ACTION_EXECUTION,
+            current_turn_authorizes_execution=True,
+        )
     payload = json.dumps(
         {
             "history_context": history or [],

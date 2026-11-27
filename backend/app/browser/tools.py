@@ -5,9 +5,13 @@ dependency. The orchestrator owns registration and approval decisions.
 """
 from __future__ import annotations
 
+import base64
+import hashlib
+import logging
 from dataclasses import dataclass
 from functools import wraps
 from threading import RLock
+from time import monotonic
 from typing import Any, Callable, Literal, Protocol
 from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID
@@ -24,10 +28,14 @@ from backend.app.browser.workflow_store import WorkflowStore
 from backend.app.schemas.contracts import (
     EvidenceItem,
     EvidenceSourceType,
+    EventStatus,
     ToolCall,
     ToolDefinition,
     ToolResult,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 class BrowserInput(BaseModel):
@@ -146,14 +154,53 @@ def _session_serialized(method):
         resume_without_session = (
             method.__name__ == "replay" and arguments.operation == "resume"
         )
+        existing = None
+        if not resume_without_session:
+            resolver = getattr(manager, "get_session_for_tool_call", None)
+            if callable(resolver):
+                try:
+                    existing = resolver(tool_call)
+                except Exception:
+                    existing = None
+        launch_started_at = monotonic()
+        launch_attempted = not resume_without_session and existing is None
+        session_acquired = False
+        if launch_attempted:
+            self._emit_execution(
+                tool_call, "browser.launch_started", EventStatus.RUNNING,
+                "Starting a task-scoped browser session",
+            )
         try:
             with lease(tool_call, create=not resume_without_session) as session:
+                session_acquired = session is not None
                 if session is None and not resume_without_session:
+                    if launch_attempted:
+                        self._emit_execution(
+                            tool_call, "browser.launch_failed", EventStatus.FAILED,
+                            "Browser session could not be launched",
+                            duration_ms=max(0, int((monotonic() - launch_started_at) * 1000)),
+                            error_category="browser_launch_failure",
+                        )
                     return self._unavailable()
+                if launch_attempted and session is not None:
+                    self._emit_execution(
+                        tool_call, "browser.launch_completed", EventStatus.RUNNING,
+                        "Task-scoped browser session launched",
+                        session=session,
+                        duration_ms=max(0, int((monotonic() - launch_started_at) * 1000)),
+                    )
                 # Resume is allowed through to WorkflowReplay without a live
                 # session so the encrypted store can mark continuity lost.
                 return method(self, arguments, tool_call)
         except Exception:
+            if launch_attempted and not session_acquired:
+                self._emit_execution(
+                    tool_call, "browser.launch_failed", EventStatus.FAILED,
+                    "Browser session could not be launched",
+                    duration_ms=max(0, int((monotonic() - launch_started_at) * 1000)),
+                    error_category="browser_launch_failure",
+                )
+                return self._unavailable()
             return self._failed("Task-scoped browser operation could not be completed safely")
 
     return wrapped
@@ -170,12 +217,20 @@ class BrowserToolAdapter:
         replay_engine: WorkflowReplay | None = None,
         policy_handoff: ReplayPolicyHandoff | None = None,
         resume_context_provider: ReplayResumeContextProvider | None = None,
+        live_event_publisher: Callable[..., Any] | None = None,
+        execution_event_publisher: Callable[..., Any] | None = None,
+        task_allowed_hosts_provider: Callable[[ToolCall], Any] | None = None,
+        provider_name: str = "local_chromium",
     ) -> None:
         self.workflow_store = workflow_store
         self.session_manager = session_manager
         self.replay_engine = replay_engine
         self.policy_handoff = policy_handoff
         self.resume_context_provider = resume_context_provider
+        self.live_event_publisher = live_event_publisher
+        self.execution_event_publisher = execution_event_publisher
+        self.task_allowed_hosts_provider = task_allowed_hosts_provider
+        self.provider_name = provider_name
         self._recorders: dict[UUID, tuple[UUID, BrowserRecorder]] = {}
         # Verification context is private to the adapter and is consumed by the
         # executor's independent verifier immediately after each tool call.
@@ -231,21 +286,146 @@ class BrowserToolAdapter:
 
     @_session_serialized
     def navigate(self, arguments: BrowserNavigateInput, tool_call: ToolCall) -> ToolResult:
+        self._emit_live(tool_call, "connecting_to_browserless" if self.provider_name == "browserless_cloud_demo" else "connecting_to_browser", "Connecting to browser provider")
         session = self._session(tool_call)
         if session is None:
+            self._emit_live(tool_call, "failed", "Browser session could not be created")
             return self._unavailable()
         try:
+            if getattr(session.controller, "provider_name", None) == "browserless_cloud_demo":
+                provider = self.task_allowed_hosts_provider
+                setter = getattr(session.controller, "set_task_allowed_hosts", None)
+                if not callable(provider) or not callable(setter):
+                    raise BrowserControllerError("policy", "Task-scoped Browserless authorization is unavailable")
+                setter(provider(tool_call))
+            self._emit_live(tool_call, "browser_session_created", "Browser session created", session=session)
             requested_url = str(arguments.url)
-            final_url = session.controller.navigate(str(arguments.url))
-            observation = self._observe(session.controller)
-            self._set_verification_context(tool_call, {"operation": "navigate", "requested_url": requested_url})
+            self._emit_live(tool_call, "navigating_to_website", "Navigating to website", session=session, url=self._safe_page_url(requested_url))
+            navigation_started_at = monotonic()
+            self._emit_execution(
+                tool_call, "browser.navigation_started", EventStatus.RUNNING,
+                "Navigating the active browser session to the requested URL",
+                session=session, diagnostic={"url": self._safe_page_url(requested_url)},
+            )
+            navigate_with_screenshots = getattr(session.controller, "navigate_with_screenshots", None)
+            try:
+                if getattr(session.controller, "provider_name", None) == "browserless_cloud_demo" and callable(navigate_with_screenshots):
+                    final_url = navigate_with_screenshots(
+                        str(arguments.url),
+                        lambda frame: self._emit_live(
+                            tool_call,
+                            "screenshot_updated",
+                            "Live browser screenshot updated",
+                            session=session,
+                            url=self._safe_page_url(session.controller.current_url),
+                            title=session.controller.title(),
+                            screenshot_png=frame,
+                        ),
+                    )
+                else:
+                    final_url = session.controller.navigate(str(arguments.url))
+            except Exception:
+                rejection = getattr(session.controller, "last_policy_rejection", None)
+                is_policy_rejection = (
+                    getattr(session.controller, "provider_name", None) == "browserless_cloud_demo"
+                    and isinstance(rejection, dict)
+                    and isinstance(rejection.get("reason"), str)
+                )
+                self._emit_execution(
+                    tool_call, "browser.navigation_failed", EventStatus.FAILED,
+                    (
+                        f"Browser request blocked by task policy: {rejection['reason']}"
+                        if is_policy_rejection
+                        else "Browser navigation failed before a page load was confirmed"
+                    ),
+                    session=session,
+                    duration_ms=max(0, int((monotonic() - navigation_started_at) * 1000)),
+                    error_category=(
+                        "destination_policy_rejected" if is_policy_rejection
+                        else "browserless_provider_or_transport_failure"
+                        if getattr(session.controller, "provider_name", None) == "browserless_cloud_demo"
+                        else "navigation_failure"
+                    ),
+                    diagnostic=(
+                        {"policy": "browserless_task_scoped", "reason": rejection["reason"]}
+                        if is_policy_rejection
+                        else {"failure_source": "provider_or_transport"}
+                        if getattr(session.controller, "provider_name", None) == "browserless_cloud_demo"
+                        else None
+                    ),
+                )
+                raise
+            self._emit_execution(
+                tool_call, "browser.navigation_completed", EventStatus.COMPLETED,
+                "Browser navigation reached a committed page",
+                session=session,
+                duration_ms=max(0, int((monotonic() - navigation_started_at) * 1000)),
+                diagnostic={"final_url": self._safe_page_url(final_url)},
+            )
+            self._emit_live(tool_call, "page_loaded", "Page loaded", session=session, url=self._safe_page_url(final_url), title=session.controller.title())
+            self._emit_live(tool_call, "extracting_content", "Extracting visible page content", session=session, url=self._safe_page_url(final_url), title=session.controller.title())
+            extraction_started_at = monotonic()
+            try:
+                observation = self._observe(session.controller)
+            except Exception:
+                self._emit_execution(
+                    tool_call, "browser.extraction_failed", EventStatus.FAILED,
+                    "Visible page content could not be extracted",
+                    session=session,
+                    duration_ms=max(0, int((monotonic() - extraction_started_at) * 1000)),
+                    error_category="result_extraction_failure",
+                )
+                raise
+            self._emit_execution(
+                tool_call, "browser.results_extracted", EventStatus.COMPLETED,
+                "Visible page information was extracted from the active browser",
+                session=session,
+                duration_ms=max(0, int((monotonic() - extraction_started_at) * 1000)),
+                diagnostic={"extracted_fields": sorted(observation.keys())},
+            )
+            self._emit_live(tool_call, "capturing_screenshot", "Capturing screenshot from the active browser page", session=session, url=observation["url"], title=observation["title"])
+            screenshot_started_at = monotonic()
+            try:
+                image = session.controller.screenshot_png(max_bytes=512 * 1024)
+            except Exception:
+                self._emit_execution(
+                    tool_call, "browser.screenshot_failed", EventStatus.FAILED,
+                    "Screenshot capture failed for the observed page",
+                    session=session,
+                    duration_ms=max(0, int((monotonic() - screenshot_started_at) * 1000)),
+                    error_category="screenshot_capture_failure",
+                )
+                raise
+            screenshot_digest = hashlib.sha256(image).hexdigest()
+            self._emit_execution(
+                tool_call, "browser.screenshot_captured", EventStatus.COMPLETED,
+                "A bounded screenshot was captured from the active browser page",
+                session=session,
+                duration_ms=max(0, int((monotonic() - screenshot_started_at) * 1000)),
+                screenshot_reference=f"sha256:{screenshot_digest}",
+            )
+            self._emit_live(tool_call, "screenshot_updated", "Live browser screenshot updated", session=session, url=observation["url"], title=observation["title"], screenshot_png=image)
+            screenshot_evidence = self._attach_local_demo_screenshot(session.controller, observation, tool_call.task_id, image=image)
+            if getattr(session.controller, "provider_name", "") == "browserless_cloud_demo":
+                screenshot_evidence = self._attach_page_screenshot(observation, tool_call.task_id, image, "Browserless Cloud PNG screenshot")
+            self._set_verification_context(tool_call, {
+                "operation": "navigate",
+                "requested_url": requested_url,
+                "provider": getattr(session.controller, "provider_name", self.provider_name),
+            })
             return self._success(
                 {"navigated": True, "page_observation": observation},
                 task_call=tool_call,
                 claim="The browser reached the requested page and captured its visible content",
                 source_url=self._safe_page_url(final_url),
+                additional_evidence=screenshot_evidence,
             )
         except Exception:
+            if getattr(session.controller, "provider_name", None) == "browserless_cloud_demo":
+                result = self._browserless_navigation_failure(session.controller)
+                self._emit_live(tool_call, "failed", result.error or "Browserless navigation failed", session=session)
+                return result
+            self._emit_live(tool_call, "failed", "Browser navigation or observation failed", session=session)
             return self._failed("Browser navigation failed safely")
 
     @_session_serialized
@@ -254,17 +434,85 @@ class BrowserToolAdapter:
         if session is None:
             return self._unavailable()
         try:
+            self._emit_live(tool_call, "extracting_content", "Reading the current page before the click", session=session, url=self._safe_page_url(session.controller.current_url), title=session.controller.title())
             before = self._observe(session.controller)
-            session.controller.click(arguments.target)
-            observation = self._observe(session.controller)
+            action_started_at = monotonic()
+            self._emit_execution(
+                tool_call, "browser.interaction_started", EventStatus.RUNNING,
+                "Performing the approved browser interaction", session=session,
+            )
+            try:
+                session.controller.click(arguments.target)
+            except Exception:
+                self._emit_execution(
+                    tool_call, "browser.interaction_failed", EventStatus.FAILED,
+                    "The approved browser interaction failed",
+                    session=session,
+                    duration_ms=max(0, int((monotonic() - action_started_at) * 1000)),
+                    error_category="browser_action_failure",
+                )
+                raise
+            self._emit_execution(
+                tool_call, "browser.interaction_completed", EventStatus.COMPLETED,
+                "The approved browser interaction completed",
+                session=session,
+                duration_ms=max(0, int((monotonic() - action_started_at) * 1000)),
+            )
+            extraction_started_at = monotonic()
+            try:
+                observation = self._observe(session.controller)
+            except Exception:
+                self._emit_execution(
+                    tool_call, "browser.extraction_failed", EventStatus.FAILED,
+                    "Visible page content could not be extracted after the interaction",
+                    session=session,
+                    duration_ms=max(0, int((monotonic() - extraction_started_at) * 1000)),
+                    error_category="result_extraction_failure",
+                )
+                raise
+            self._emit_execution(
+                tool_call, "browser.results_extracted", EventStatus.COMPLETED,
+                "Visible page information was extracted after the browser interaction",
+                session=session,
+                duration_ms=max(0, int((monotonic() - extraction_started_at) * 1000)),
+                diagnostic={"extracted_fields": sorted(observation.keys())},
+            )
+            self._emit_live(tool_call, "page_loaded", "Page updated after click", session=session, url=observation["url"], title=observation["title"])
+            self._emit_live(tool_call, "capturing_screenshot", "Capturing screenshot from the active browser page", session=session, url=observation["url"], title=observation["title"])
+            screenshot_started_at = monotonic()
+            try:
+                image = session.controller.screenshot_png(max_bytes=512 * 1024)
+            except Exception:
+                self._emit_execution(
+                    tool_call, "browser.screenshot_failed", EventStatus.FAILED,
+                    "Screenshot capture failed for the observed page",
+                    session=session,
+                    duration_ms=max(0, int((monotonic() - screenshot_started_at) * 1000)),
+                    error_category="screenshot_capture_failure",
+                )
+                raise
+            self._emit_execution(
+                tool_call, "browser.screenshot_captured", EventStatus.COMPLETED,
+                "A bounded screenshot was captured after the browser interaction",
+                session=session,
+                duration_ms=max(0, int((monotonic() - screenshot_started_at) * 1000)),
+                screenshot_reference=f"sha256:{hashlib.sha256(image).hexdigest()}",
+            )
+            self._emit_live(tool_call, "screenshot_updated", "Live browser screenshot updated", session=session, url=observation["url"], title=observation["title"], screenshot_png=image)
+            screenshot_evidence = self._attach_local_demo_screenshot(session.controller, observation, tool_call.task_id, image=image)
+            if getattr(session.controller, "provider_name", "") == "browserless_cloud_demo":
+                screenshot_evidence = self._attach_page_screenshot(observation, tool_call.task_id, image, "Browserless Cloud PNG screenshot")
             self._set_verification_context(tool_call, {
                 "operation": "click", "before": before, "target": dict(arguments.target),
+                "provider": getattr(session.controller, "provider_name", "local_chromium"),
             })
             return self._success(
                 {"clicked": True, "page_observation": observation}, task_call=tool_call,
                 claim="The browser click changed the observed page state", source_url=observation["url"],
+                additional_evidence=screenshot_evidence,
             )
         except Exception:
+            self._emit_live(tool_call, "failed", "Browser click failed", session=session)
             return self._failed("Browser click failed safely")
 
     @_session_serialized
@@ -446,19 +694,56 @@ class BrowserToolAdapter:
             actual = self._observe(session.controller)
         except Exception:
             return False
-        observed = result.data.get("page_observation")
-        if observed is not None and observed != actual:
-            return False
         operation = context.get("operation")
+        observed = result.data.get("page_observation")
+        if operation == "navigate" and not isinstance(observed, dict):
+            return False
+        if isinstance(observed, dict):
+            required_page_fields = {"url", "title", "visible_text", "truncated", "content_trust"}
+            if operation == "navigate" and not required_page_fields.issubset(observed):
+                return False
+            if operation == "navigate" and (
+                not isinstance(observed.get("url"), str)
+                or not isinstance(observed.get("title"), str)
+                or not observed["title"].strip()
+                or not isinstance(observed.get("visible_text"), str)
+                or not observed["visible_text"].strip()
+                or not isinstance(observed.get("truncated"), bool)
+                or observed.get("content_trust") != "untrusted_webpage_data"
+            ):
+                return False
+            screenshot_fields = {"screenshot_format", "screenshot_sha256", "screenshot_base64"}
+            if operation == "navigate" and context.get("provider") == "browserless_cloud_demo":
+                if not screenshot_fields.issubset(observed):
+                    return False
+            if any(key in observed for key in ("screenshot_format", "screenshot_sha256", "screenshot_base64")):
+                if not self._valid_screenshot_observation(observed, result.evidence):
+                    return False
+            observed_page = {key: value for key, value in observed.items() if key not in {"screenshot_base64", "screenshot_sha256", "screenshot_format"}}
+            if observed_page != actual:
+                return False
+        elif observed is not None and observed != actual:
+            return False
         if operation == "navigate":
+            requested_origin = self._safe_page_origin(context.get("requested_url", ""))
+            observed_origin = self._safe_page_origin(actual.get("url", ""))
             return (
                 tool_name == "browser.navigate"
-                and actual["url"] == self._safe_page_url(context.get("requested_url", ""))
+                and result.data.get("navigated") is True
+                and requested_origin is not None
+                and observed_origin == requested_origin
                 and bool(actual["title"])
+                and bool(actual["visible_text"].strip())
             )
         if operation == "click":
             before = context.get("before")
             target = context.get("target", {})
+            if context.get("provider") == "browserless_cloud_demo":
+                return (
+                    tool_name == "browser.click"
+                    and isinstance(before, dict)
+                    and (actual["url"] != before.get("url") or actual["visible_text"] != before.get("visible_text"))
+                )
             return (
                 tool_name == "browser.click"
                 and isinstance(before, dict)
@@ -484,6 +769,32 @@ class BrowserToolAdapter:
                 return False
         return False
 
+    @staticmethod
+    def _valid_screenshot_observation(observation: dict[str, Any], evidence: list[EvidenceItem]) -> bool:
+        try:
+            if observation.get("screenshot_format") != "image/png":
+                return False
+            encoded = observation.get("screenshot_base64")
+            expected = observation.get("screenshot_sha256")
+            if not isinstance(encoded, str) or len(encoded) > 700_000 or not isinstance(expected, str) or len(expected) != 64:
+                return False
+            image = base64.b64decode(encoded, validate=True)
+            if not image.startswith(b"\x89PNG\r\n\x1a\n") or len(image) > 512 * 1024:
+                return False
+            digest = hashlib.sha256(image).hexdigest()
+            if digest != expected:
+                return False
+            source_url = observation.get("url")
+            return any(
+                item.source_url is not None
+                and str(item.source_url) == source_url
+                and isinstance(item.excerpt, str)
+                and digest in item.excerpt
+                for item in evidence
+            )
+        except (ValueError, TypeError):
+            return False
+
     def _set_verification_context(self, tool_call: ToolCall, context: dict[str, Any]) -> None:
         with self._lock:
             self._verification_context[tool_call.task_id] = context
@@ -503,6 +814,120 @@ class BrowserToolAdapter:
         }
 
     @staticmethod
+    def _attach_local_demo_screenshot(controller: BrowserController, observation: dict[str, Any], task_id: UUID, *, image: bytes | None = None) -> list[EvidenceItem]:
+        """Include screenshot evidence only for the fixed synthetic fixture."""
+        try:
+            parts = urlsplit(observation.get("url", ""))
+            if (parts.scheme, parts.hostname, parts.port, parts.path) not in {
+                ("http", "unbound-demo.invalid", None, "/details"),
+            }:
+                return []
+            image = image or controller.screenshot_png(max_bytes=1_000_000)
+        except Exception:
+            # The fixture workflow must not report success without its requested evidence.
+            raise
+        digest = hashlib.sha256(image).hexdigest()
+        observation["screenshot_format"] = "image/png"
+        observation["screenshot_sha256"] = digest
+        observation["screenshot_base64"] = base64.b64encode(image).decode("ascii")
+        return [EvidenceItem(
+            task_id=task_id,
+            source_type=EvidenceSourceType.BROWSER,
+            source_name="Local Demo PNG screenshot",
+            source_url=observation["url"],
+            excerpt=f"PNG SHA-256: {digest}",
+            supports_claim="A bounded screenshot was captured from the fixed synthetic Local Demo page.",
+        )]
+
+    @staticmethod
+    def _attach_page_screenshot(observation: dict[str, Any], task_id: UUID, image: bytes, source_name: str) -> list[EvidenceItem]:
+        digest = hashlib.sha256(image).hexdigest()
+        observation["screenshot_format"] = "image/png"
+        observation["screenshot_sha256"] = digest
+        observation["screenshot_base64"] = base64.b64encode(image).decode("ascii")
+        return [EvidenceItem(
+            task_id=task_id,
+            source_type=EvidenceSourceType.BROWSER,
+            source_name=source_name,
+            source_url=observation["url"],
+            excerpt=f"PNG SHA-256: {digest}",
+            supports_claim="A bounded screenshot was captured from the observed browser page.",
+        )]
+
+    def _emit_live(
+        self,
+        tool_call: ToolCall,
+        event_type: str,
+        description: str,
+        *,
+        session: BrowserSessionBinding | None = None,
+        url: str | None = None,
+        title: str | None = None,
+        screenshot_png: bytes | None = None,
+    ) -> None:
+        if not callable(self.live_event_publisher):
+            return
+        try:
+            self.live_event_publisher(
+                tool_call.task_id,
+                event_type,
+                description,
+                step_id=tool_call.step_id,
+                session_id=session.session_id if session else None,
+                url=url,
+                title=title,
+                provider=getattr(session.controller, "provider_name", self.provider_name) if session else self.provider_name,
+                screenshot_png=screenshot_png,
+            )
+        except Exception:
+            # Live view is observability; event transport failure must never
+            # change the browser operation's security or execution result.
+            return
+
+    def _emit_execution(
+        self,
+        tool_call: ToolCall,
+        event_type: str,
+        status: EventStatus,
+        message: str,
+        *,
+        session: BrowserSessionBinding | None = None,
+        duration_ms: int | None = None,
+        result_count: int | None = None,
+        screenshot_reference: str | None = None,
+        error_category: str | None = None,
+        diagnostic: dict[str, Any] | None = None,
+    ) -> None:
+        if not callable(self.execution_event_publisher):
+            return
+        controller = session.controller if session is not None else None
+        provider_session_id = getattr(controller, "provider_session_id", None) if controller is not None else None
+        try:
+            self.execution_event_publisher(
+                tool_call.task_id,
+                event_type,
+                status,
+                message,
+                step_id=tool_call.step_id,
+                tool_name=tool_call.tool_name,
+                browser_session_id=str(session.session_id) if session is not None else None,
+                provider_session_id=str(provider_session_id)[:160] if provider_session_id else None,
+                duration_ms=duration_ms,
+                result_count=result_count,
+                screenshot_reference=screenshot_reference,
+                error_category=error_category,
+                diagnostic=diagnostic,
+            )
+        except Exception as exc:
+            # Diagnostic persistence failure must not alter browser security or
+            # claim an operation result. The executor's own result checkpoint
+            # independently records whether the operation was persisted.
+            logger.warning(
+                "Browser execution event could not be persisted: event_type=%s exception_class=%s",
+                event_type, type(exc).__name__,
+            )
+
+    @staticmethod
     def _safe_page_url(value: str) -> str:
         try:
             parts = urlsplit(_validate_http_url(value))
@@ -511,6 +936,23 @@ class BrowserToolAdapter:
             return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path or "/", "", ""))
         except Exception:
             return ""
+
+    @classmethod
+    def _safe_page_origin(cls, value: str) -> tuple[str, str, int] | None:
+        """Return a normalized origin for safe same-origin redirect checks."""
+        try:
+            safe_url = cls._safe_page_url(value)
+            if not safe_url:
+                return None
+            parts = urlsplit(safe_url)
+            scheme = parts.scheme.lower()
+            hostname = parts.hostname
+            if not hostname:
+                return None
+            port = parts.port or (443 if scheme == "https" else 80)
+            return scheme, hostname.casefold().rstrip("."), port
+        except (ValueError, TypeError):
+            return None
 
     @staticmethod
     def _is_local_demo_details_state(actual: dict[str, Any], target: dict[str, Any]) -> bool:
@@ -555,6 +997,7 @@ class BrowserToolAdapter:
         task_call: ToolCall,
         claim: str,
         source_url: str | None = None,
+        additional_evidence: list[EvidenceItem] | None = None,
     ) -> ToolResult:
         evidence = []
         data = {**data, "task_id": str(task_call.task_id)}
@@ -569,6 +1012,8 @@ class BrowserToolAdapter:
                 )]
             except Exception:
                 evidence = []
+        if additional_evidence:
+            evidence.extend(additional_evidence)
         return ToolResult(success=True, data=data, evidence=evidence)
 
     @staticmethod
@@ -595,6 +1040,24 @@ class BrowserToolAdapter:
     @staticmethod
     def _failed(message: str) -> ToolResult:
         return ToolResult(success=False, error=message)
+
+    @staticmethod
+    def _browserless_navigation_failure(controller: Any) -> ToolResult:
+        """Distinguish a proven local policy block from provider/transport failure."""
+        rejection = getattr(controller, "last_policy_rejection", None)
+        if isinstance(rejection, dict) and isinstance(rejection.get("reason"), str):
+            reason = rejection["reason"]
+            return ToolResult(
+                success=False,
+                data={"failure_code": "browserless_destination_rejected", "rejection_reason": reason},
+                error=f"Browser request blocked by task policy: {reason}",
+            )
+        message = "Browserless navigation failed; no application policy rejection was recorded"
+        return ToolResult(
+            success=False,
+            data={"failure_code": "browserless_provider_or_transport_failure"},
+            error=message,
+        )
 
 
 def browser_tool_bindings(adapter: BrowserToolAdapter) -> tuple[BrowserToolBinding, ...]:

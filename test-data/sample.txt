@@ -1,0 +1,11 @@
+﻿UNBOUND AI - File Analysis Test
+Artificial Intelligence is transforming how organizations process information.
+Key areas of development include:
+1. Natural Language Processing
+2. Machine Learning
+3. Autonomous Agents
+4. Evidence-Based Decision Making
+A reliable AI system should distinguish verified facts from assumptions.
+It should preserve source references and provide explanations for its conclusions.
+The main objective of UNBOUND AI is to build an agent that can understand requests,
+plan actions, obtain user approval, execute tasks and produce verifiable results.

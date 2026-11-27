@@ -8,7 +8,7 @@ from uuid import UUID, uuid4
 import pytest
 from pydantic import BaseModel, ConfigDict
 
-from backend.app.browser.tools import BrowserNavigateInput
+from backend.app.browser.tools import BrowserClickInput, BrowserNavigateInput
 from backend.app.documents.tools import CONTEXT_RETRIEVE_DEFINITION, ContextRetrieveInput
 from backend.app.llm.provider import LLMConfigurationError, get_provider_from_env
 from backend.app.orchestrator.executor import TaskExecutor, synthesize_result
@@ -133,6 +133,29 @@ def browser_retrieval_registry() -> ToolRegistry:
     return tools
 
 
+def browser_action_registry(click_execute, navigation_execute=None) -> ToolRegistry:
+    tools = ToolRegistry()
+    tools.register(
+        ToolDefinition(
+            tool_name="browser.navigate",
+            description="Navigate to a page and return its bounded visible-content observation.",
+            input_schema=BrowserNavigateInput.model_json_schema(),
+        ),
+        BrowserNavigateInput,
+        navigation_execute or (lambda _arguments, _call: ToolResult(success=True, data={"verified": True})),
+    )
+    tools.register(
+        ToolDefinition(
+            tool_name="browser.click",
+            description="Click one element identified by a structured browser locator.",
+            input_schema=BrowserClickInput.model_json_schema(),
+        ),
+        BrowserClickInput,
+        click_execute,
+    )
+    return tools
+
+
 def create_task(manager: TaskManager, goal: str, steps: list[TaskStep], *, auto_execute: bool = False, missing_information=None):
     request = TaskCreateRequest(user_request=goal, auto_execute=auto_execute)
     return manager.create(request, steps, missing_information)
@@ -167,6 +190,201 @@ def test_plan_uses_registered_shared_tool_and_validates_input():
     assert isinstance(plan.steps[0], TaskStep)
 
 
+def test_simple_readonly_page_analysis_with_classified_intent_uses_navigation_without_click():
+    tools = browser_action_registry(lambda _arguments, _call: ToolResult(success=True, data={"verified": True}))
+    plan = generate_plan(
+        "Open https://github.com/features, analyze the page, and extract the title and main text.",
+        tools,
+        FakeProvider([]),
+        intent=TaskIntent(goal="Analyze the supplied webpage", required_capabilities=["browser.navigate"]),
+    )
+
+    assert [step.tool_name for step in plan.steps] == ["browser.navigate"]
+    assert plan.steps[0].input == {"url": "https://github.com/features"}
+
+
+def test_planner_moves_nested_step_metadata_out_of_browser_click_arguments():
+    tools = browser_action_registry(lambda _arguments, _call: ToolResult(success=True, data={"verified": True}))
+    draft = PlanDraft(steps=[
+        TaskStep(
+            step_id="navigate",
+            tool_name="browser.navigate",
+            description="Open the page",
+            input={"url": "https://example.com"},
+            expected_outcome="Page is loaded",
+        ),
+        TaskStep(
+            step_id="click_details",
+            tool_name="browser.click",
+            description="Click the requested details link",
+            input={
+                "target": {"type": "text", "value": "View details"},
+                "depends_on": ["navigate"],
+                "requires_approval": True,
+                "error": "untrusted planner field",
+                "verification": {"verified": True},
+            },
+            expected_outcome="Details are displayed",
+        ),
+    ])
+    plan = generate_plan(
+        "Open https://example.com and click View details.",
+        tools,
+        FakeProvider([draft]),
+        intent=TaskIntent(goal="Open the page and click details", required_capabilities=["browser.navigate", "browser.click"]),
+    )
+
+    click = plan.steps[1]
+    assert click.input == {"target": {"type": "text", "value": "View details"}}
+    assert click.depends_on == ["navigate"]
+    assert click.requires_approval is True
+    assert click.error is None
+    assert click.verification is None
+
+
+def test_executor_keeps_step_metadata_and_dispatches_only_registered_click_arguments():
+    dispatched = []
+    tools = browser_action_registry(
+        lambda arguments, _call: dispatched.append(arguments.model_dump(mode="json"))
+        or ToolResult(success=True, data={"verified": True}),
+    )
+    draft = PlanDraft(steps=[
+        TaskStep(
+            step_id="navigate",
+            tool_name="browser.navigate",
+            description="Open the page",
+            input={"url": "https://example.com"},
+            expected_outcome="Page is loaded",
+        ),
+        TaskStep(
+            step_id="click_details",
+            tool_name="browser.click",
+            description="Click the requested details link",
+            input={
+                "target": {"type": "text", "value": "View details"},
+                "depends_on": ["navigate"],
+                "requires_approval": True,
+                "error": "untrusted planner field",
+                "verification": {"verified": True},
+            },
+            expected_outcome="Details are displayed",
+        ),
+    ])
+    manager = TaskManager()
+    # Exercise the executor-side compatibility boundary directly, as it must
+    # also protect persisted plans created before planner normalization.
+    task = manager.create(TaskCreateRequest(user_request="Open the page and click details"), draft.steps)
+    executor = TaskExecutor(manager, tools, verifier)
+
+    waiting = executor.run(task.task_id)
+    assert waiting.status == TaskStatus.AWAITING_APPROVAL
+    assert waiting.plan[1].depends_on == ["navigate"]
+    assert waiting.plan[1].requires_approval is True
+    assert waiting.plan[1].error is None
+    approval = waiting.pending_approvals[0]
+    manager.resolve_approval(task.task_id, approval.approval_id, ApprovalStatus.APPROVED)
+    completed = executor.run(task.task_id)
+
+    assert completed.status == TaskStatus.COMPLETED
+    assert dispatched == [{"target": {"type": "text", "value": "View details"}}]
+    assert completed.plan[1].depends_on == ["navigate"]
+    assert completed.plan[1].requires_approval is True
+    assert completed.plan[1].verification["verified"] is True
+
+
+def test_invalid_browser_click_argument_fails_before_tool_dispatch():
+    dispatched = []
+    tools = browser_action_registry(
+        lambda arguments, _call: dispatched.append(arguments.model_dump(mode="json"))
+        or ToolResult(success=True, data={"verified": True}),
+    )
+    manager = TaskManager()
+    task = manager.create(TaskCreateRequest(user_request="Click the link"), [TaskStep(
+        step_id="click",
+        tool_name="browser.click",
+        description="Click the link",
+        input={"target": {"type": "text", "value": "View details"}, "unsupported": "value"},
+        expected_outcome="The link is opened",
+    )])
+
+    result = TaskExecutor(manager, tools, verifier).run(task.task_id)
+
+    assert result.status == TaskStatus.FAILED
+    assert result.plan[0].error == "Invalid input for 'browser.click' (fields: unsupported)"
+    assert dispatched == []
+
+
+def test_empty_local_search_is_reported_as_no_results_and_blocks_dependents():
+    invoked = []
+    tools = registry(
+        lambda _arguments, _call: invoked.append("document.search")
+        or ToolResult(success=True, data={"query": "AI agents", "results": [], "total": 0})
+    )
+    tools.register(
+        CONTEXT_RETRIEVE_DEFINITION,
+        ContextRetrieveInput,
+        lambda _arguments, _call: invoked.append("context.retrieve") or ToolResult(success=True, data={"verified": True}),
+    )
+    manager = TaskManager()
+    task = create_task(manager, "Search public AI research", [
+        TaskStep(
+            step_id="s1", tool_name="document.search", description="Search indexed documents",
+            input={"query": "AI agents"}, expected_outcome="Search results are returned",
+        ),
+        TaskStep(
+            step_id="s2", tool_name="context.retrieve", description="Retrieve from search results",
+            input={"query": "AI agents", "top_k": 5}, expected_outcome="Matching excerpts are returned",
+            depends_on=["s1"],
+        ),
+    ])
+
+    result = TaskExecutor(manager, tools, verifier).run(task.task_id)
+
+    assert result.status == TaskStatus.NEEDS_ATTENTION
+    assert result.error == "Search completed but found no matching indexed documents; dependent steps were not run."
+    assert result.plan[0].status == StepStatus.FAILED
+    assert result.plan[1].status == StepStatus.PENDING
+    assert invoked == ["document.search"]
+    assert "external outcome is unknown" not in result.error
+
+
+def test_verified_search_result_document_ids_are_bound_to_dependent_retrieval():
+    document_id = "d775f4a3-cc76-4a9a-adf9-2b0bd3e30e33"
+    observed_inputs = []
+    tools = registry(lambda _arguments, _call: ToolResult(success=True, data={
+        "verified": True,
+        "query": "AI agents",
+        "results": [{"document_id": document_id}],
+        "total": 1,
+    }))
+    tools.register(
+        CONTEXT_RETRIEVE_DEFINITION,
+        ContextRetrieveInput,
+        lambda arguments, _call: observed_inputs.append(arguments.document_ids)
+        or ToolResult(success=True, data={"verified": True}),
+    )
+    manager = TaskManager()
+    task = create_task(manager, "Search indexed AI research", [
+        TaskStep(
+            step_id="s1", tool_name="document.search", description="Search indexed documents",
+            input={"query": "AI agents"}, expected_outcome="Search results are returned",
+        ),
+        TaskStep(
+            step_id="s2", tool_name="context.retrieve", description="Retrieve matching search results",
+            input={"query": "AI agents", "top_k": 5}, expected_outcome="Matching excerpts are returned",
+            depends_on=["s1"],
+        ),
+    ])
+
+    result = TaskExecutor(
+        manager, tools, verifier, document_id_validator=lambda value: value == document_id
+    ).run(task.task_id)
+
+    assert result.status == TaskStatus.COMPLETED
+    assert observed_inputs == [[document_id]]
+    assert result.plan[1].input["document_ids"] == [document_id]
+
+
 @pytest.mark.parametrize("user_request", [
     "Open https://example.test/product and tell me its version and features.",
     "Navigate to https://example.test/product and summarize the page.",
@@ -190,6 +408,52 @@ def test_page_observation_requests_drop_redundant_context_retrieval(user_request
         ("browser.navigate", {"url": "https://example.test/product"}),
     ]
     assert plan.missing_information == []
+
+
+def test_explicit_browser_url_repairs_qwen_output_hints_without_changing_scope():
+    navigation = TaskStep(
+        step_id="navigate", tool_name="browser.navigate", description="Extract the page title and text",
+        input={"extract_main_text": True}, expected_outcome="The requested page title and visible text are observed",
+    )
+    plan = generate_plan(
+        "Open https://example.test/product, extract the page title and main text.",
+        browser_retrieval_registry(),
+        FakeProvider([TaskIntent(goal="Read the page"), PlanDraft(steps=[navigation])]),
+    )
+
+    assert len(plan.steps) == 1
+    assert plan.steps[0].tool_name == "browser.navigate"
+    assert plan.steps[0].input == {"url": "https://example.test/product"}
+    assert plan.missing_information == []
+
+
+def test_page_only_plan_drops_redundant_document_search_after_navigation():
+    tools = browser_retrieval_registry()
+    tools.register(
+        ToolDefinition(
+            tool_name="document.search",
+            description="Search indexed documents",
+            input_schema=SearchInput.model_json_schema(),
+        ),
+        SearchInput,
+        lambda _arguments, _call: ToolResult(success=True),
+    )
+    navigation = TaskStep(
+        step_id="navigate", tool_name="browser.navigate", description="Read page",
+        input={"url": "https://example.test/product"}, expected_outcome="Page content observed",
+    )
+    unrelated_search = TaskStep(
+        step_id="search_page_text", tool_name="document.search", description="Search page text in documents",
+        input={"query": "page title and main text"}, expected_outcome="Document matches returned",
+    )
+
+    plan = generate_plan(
+        "Open https://example.test/product and extract the page title and main text.",
+        tools,
+        FakeProvider([TaskIntent(goal="Read the webpage"), PlanDraft(steps=[navigation, unrelated_search])]),
+    )
+
+    assert [step.tool_name for step in plan.steps] == ["browser.navigate"]
 
 
 def test_explicit_document_search_keeps_context_retrieval_after_navigation():
@@ -497,8 +761,8 @@ def test_failed_tool_execution_marks_unknown_outcome_needing_attention_without_e
     task = create_task(manager, "Find report", [search_step()])
     result = TaskExecutor(manager, tools, verifier).run(task.task_id)
     assert result.status == TaskStatus.NEEDS_ATTENTION
-    assert result.plan[0].error == "Tool invocation raised RuntimeError; its external outcome is unknown"
-    assert result.error == "Tool invocation raised RuntimeError; its external outcome is unknown"
+    assert result.plan[0].error == "Search submission failed before a result was confirmed"
+    assert result.error == "Search submission failed before a result was confirmed"
     assert "offline" not in result.error
     assert manager.events(task.task_id)[-1].event_type == "tool.outcome_unknown"
     assert manager.events(task.task_id)[-1].status == EventStatus.NEEDS_ATTENTION
@@ -786,7 +1050,7 @@ def test_cancellation_during_tool_exception_keeps_unknown_outcome_visible():
         result = future.result(timeout=3)
 
     assert result.status == TaskStatus.CANCELLED
-    assert "external outcome is unknown" in result.error
+    assert result.plan[0].verification["error_category"] == "search_submission_failure"
     assert result.plan[0].status == StepStatus.FAILED
     assert manager.events(task.task_id)[-1].event_type == "tool.outcome_unknown"
     assert manager.events(task.task_id)[-1].status == EventStatus.NEEDS_ATTENTION

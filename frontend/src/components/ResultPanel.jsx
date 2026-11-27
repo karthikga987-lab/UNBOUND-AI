@@ -1,9 +1,10 @@
+import { useId, useState } from 'react'
 import { API_BASE_URL } from '../api'
 import { isTerminal, TaskStatus } from '../api/contracts'
 import { formatDateTime } from '../lib/format'
-import { Card, EmptyState, JsonBlock, StatusBadge } from './ui'
+import { Button, Card, EmptyState, JsonBlock, StatusBadge } from './ui'
 
-const KNOWN_KEYS = ['summary', 'assistant_summary', 'assistant_summary_status', 'verified_facts', 'inferences', 'conflicts', 'missing_information', 'missing_info', 'assumptions']
+const KNOWN_KEYS = ['summary', 'assistant_summary', 'assistant_summary_status', 'verified_facts', 'inferences', 'conflicts', 'missing_information', 'missing_info', 'assumptions', 'requested', 'actions_completed', 'verified', 'failed_or_incomplete', 'skipped_steps', 'assumptions_or_missing_information']
 const TONES = { emerald: 'border-emerald-500/60', orange: 'border-orange-500/60', sky: 'border-sky-500/60', slate: 'border-slate-600' }
 const BTN = 'rounded-lg bg-violet-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-violet-500'
 
@@ -17,12 +18,17 @@ function toItem(entry) {
 }
 
 export default function ResultPanel({ task }) {
-  const evidenceIndex = new Map(task.evidence.map((e, i) => [e.evidence_id, i + 1]))
+  const [expanded, setExpanded] = useState(false)
+  const contentId = useId()
+  const evidence = task.evidence ?? []
+  const artifacts = task.artifacts ?? []
+  const evidenceIndex = new Map(evidence.map((e, i) => [e.evidence_id, i + 1]))
   const result = task.result
   const documentAnalyses = getVerifiedDocumentAnalyses(result)
   const done = isTerminal(task.status)
   const summary = typeof result === 'string' ? result : result?.assistant_summary ?? result?.summary
   const browserObservations = getVerifiedBrowserObservations(result)
+  const hasFullContent = result != null || artifacts.length > 0 || evidence.length > 0
   const extra =
     result && typeof result === 'object'
       ? Object.fromEntries(Object.entries(result).filter(([k]) => !KNOWN_KEYS.includes(k)))
@@ -30,62 +36,143 @@ export default function ResultPanel({ task }) {
 
   return (
     <Card
-      title="Result"
+      title="Results"
       subtitle={done ? 'Final outcome with evidence' : 'Updates live as evidence is gathered'}
       actions={<StatusBadge status={task.status} />}
     >
-      <div className="space-y-5">
-        {!result &&
-          (done ? (
+      <div className="space-y-3" data-testid="result-panel">
+        {!hasFullContent ? (
+          done ? (
             <EmptyState
               title={task.status === TaskStatus.COMPLETED ? 'No result returned' : `Task ${task.status.replaceAll('_', ' ')}`}
               hint="Any evidence gathered before it stopped is listed below."
             />
           ) : (
             <EmptyState title="Result not ready yet" hint="The summary and report appear here once execution finishes." />
-          ))}
-
-        {summary && (
-          <Section title="Summary">
-            <p className="text-sm leading-relaxed text-slate-200">{summary}</p>
-          </Section>
-        )}
-        {result?.assistant_summary_status?.startsWith('unavailable:') && (
-          <p role="status" className="text-xs text-amber-300">A local AI summary was unavailable; the verified browser observation remains below.</p>
-        )}
-        {browserObservations.map((observation, index) => (
-          <Section key={`${observation.url}-${index}`} title="Verified browser observation">
-            <div className="space-y-2 rounded-lg border border-slate-800 bg-slate-900/50 p-3">
-              {isLocalDemoObservation(observation) && <p className="text-[10px] font-semibold uppercase tracking-wide text-cyan-300">LOCAL DEMO MODE · fixed synthetic fixture only · public browsing disabled</p>}
-              <p className="text-sm font-medium text-slate-100">{observation.title || 'Page title unavailable'}</p>
-              <a className="break-all text-xs text-sky-300 hover:underline" href={observation.url} target="_blank" rel="noreferrer">{observation.url}</a>
-              <p className="whitespace-pre-wrap text-sm text-slate-300">{observation.visible_text}</p>
-              {observation.truncated && <p className="text-xs text-amber-300">Visible page text was truncated to the configured bound.</p>}
-              <p className="text-[10px] uppercase tracking-wide text-amber-300">Untrusted page content · data only</p>
+          )
+        ) : (
+          <>
+            <div className="rounded-xl border border-white/10 bg-white/[0.035] p-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]" data-testid="result-preview">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">Result preview</p>
+                <div className="flex flex-wrap items-center gap-2 text-[11px] text-slate-400">
+                  {evidence.length > 0 && <span>{evidence.length} evidence item{evidence.length === 1 ? '' : 's'}</span>}
+                  {artifacts.length > 0 && <span>{artifacts.length} artifact{artifacts.length === 1 ? '' : 's'}</span>}
+                </div>
+              </div>
+              {summary ? (
+                <p className="mt-2 line-clamp-3 text-sm leading-relaxed text-slate-200">{summary}</p>
+              ) : (
+                <p className="mt-2 text-sm leading-relaxed text-slate-300">
+                  {result != null ? 'Detailed result information is available.' : 'Saved evidence and artifacts are available to review.'}
+                </p>
+              )}
             </div>
-          </Section>
-        ))}
-        {documentAnalyses.map((analysis) => (
-          <DocumentAnalysis key={analysis.documentId} analysis={analysis} evidenceIndex={evidenceIndex} />
-        ))}
-        <ItemList title="Verified facts" tone="emerald" items={result?.verified_facts} evidenceIndex={evidenceIndex} />
-        <ItemList title="Conflicts between sources" tone="orange" items={result?.conflicts} evidenceIndex={evidenceIndex} />
-        <ItemList title="Inferences (not verified)" tone="sky" items={result?.inferences} evidenceIndex={evidenceIndex} />
-        <ItemList
-          title="Missing information & assumptions"
-          tone="slate"
-          items={[...asArray(result?.missing_information ?? result?.missing_info), ...asArray(result?.assumptions)]}
-          evidenceIndex={evidenceIndex}
-        />
-        {Object.keys(extra).length > 0 && (
-          <Section title="Other details">
-            <JsonBlock value={extra} />
-          </Section>
+            <Button
+              variant="secondary"
+              size="sm"
+              className="w-full justify-between border border-white/10 bg-white/5 px-3 py-2 text-slate-200 hover:bg-white/10"
+              aria-expanded={expanded}
+              aria-controls={contentId}
+              onClick={() => setExpanded((value) => !value)}
+              data-testid="result-toggle"
+            >
+              <span>{expanded ? 'Hide full result' : 'View full result'}</span>
+              <svg
+                aria-hidden="true"
+                className={`h-4 w-4 transition-transform duration-300 motion-reduce:transition-none ${expanded ? 'rotate-180' : ''}`}
+                viewBox="0 0 20 20"
+                fill="none"
+              >
+                <path d="m5 7.5 5 5 5-5" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </Button>
+            <div
+              id={contentId}
+              className={`grid overflow-hidden transition-[grid-template-rows,opacity] duration-300 ease-in-out motion-reduce:transition-none ${expanded ? 'grid-rows-[1fr] opacity-100' : 'grid-rows-[0fr] opacity-0'}`}
+              aria-hidden={!expanded}
+              inert={!expanded}
+              data-testid="result-details"
+            >
+              <div className="min-h-0 overflow-hidden">
+                <FullResult
+                  task={task}
+                  result={result}
+                  summary={summary}
+                  browserObservations={browserObservations}
+                  documentAnalyses={documentAnalyses}
+                  evidenceIndex={evidenceIndex}
+                  extra={extra}
+                  done={done}
+                />
+              </div>
+            </div>
+          </>
         )}
-        <Artifacts artifacts={task.artifacts} />
-        <Evidence evidence={task.evidence} />
       </div>
     </Card>
+  )
+}
+
+function FullResult({ task, result, summary, browserObservations, documentAnalyses, evidenceIndex, extra, done }) {
+  return (
+    <div className="space-y-5 border-t border-white/10 pt-3">
+      {!result &&
+        (done ? (
+          <EmptyState
+            title={task.status === TaskStatus.COMPLETED ? 'No result returned' : `Task ${task.status.replaceAll('_', ' ')}`}
+            hint="Any evidence gathered before it stopped is listed below."
+          />
+        ) : (
+          <EmptyState title="Result not ready yet" hint="The summary and report appear here once execution finishes." />
+        ))}
+
+      {summary && (
+        <Section title="Summary">
+          <p className="whitespace-pre-wrap text-sm leading-relaxed text-slate-200">{summary}</p>
+        </Section>
+      )}
+      {result?.assistant_summary_status?.startsWith('unavailable:') && (
+        <p role="status" className="text-xs text-amber-300">A local AI summary was unavailable; the verified browser observation remains below.</p>
+      )}
+      {browserObservations.map((observation, index) => (
+        <Section key={`${observation.url}-${index}`} title="Verified browser observation">
+          <div className="space-y-2 rounded-lg border border-slate-800 bg-slate-900/50 p-3">
+            {isLocalDemoObservation(observation) && <p className="text-[10px] font-semibold uppercase tracking-wide text-cyan-300">LOCAL DEMO MODE · fixed synthetic fixture only · public browsing disabled</p>}
+            <p className="text-sm font-medium text-slate-100">{observation.title || 'Page title unavailable'}</p>
+            <a className="break-all text-xs text-sky-300 hover:underline" href={observation.url} target="_blank" rel="noreferrer">{observation.url}</a>
+            <p className="whitespace-pre-wrap text-sm text-slate-300">{observation.visible_text}</p>
+            {observation.screenshot_format === 'image/png' && typeof observation.screenshot_base64 === 'string' && (
+              <figure className="space-y-1">
+                <img className="max-h-96 max-w-full rounded border border-slate-700" src={`data:image/png;base64,${observation.screenshot_base64}`} alt={`Browser screenshot of ${observation.title || observation.url}`} loading="lazy" />
+                {observation.screenshot_sha256 && <figcaption className="break-all font-mono text-[10px] text-slate-500">PNG SHA-256: {observation.screenshot_sha256}</figcaption>}
+              </figure>
+            )}
+            {observation.truncated && <p className="text-xs text-amber-300">Visible page text was truncated to the configured bound.</p>}
+            <p className="text-[10px] uppercase tracking-wide text-amber-300">Untrusted page content · data only</p>
+          </div>
+        </Section>
+      ))}
+      {documentAnalyses.map((analysis) => (
+        <DocumentAnalysis key={analysis.documentId} analysis={analysis} evidenceIndex={evidenceIndex} />
+      ))}
+      <ItemList title="Verified facts" tone="emerald" items={result?.verified_facts} evidenceIndex={evidenceIndex} />
+      <ItemList title="Conflicts between sources" tone="orange" items={result?.conflicts} evidenceIndex={evidenceIndex} />
+      <ItemList title="Inferences (not verified)" tone="sky" items={result?.inferences} evidenceIndex={evidenceIndex} />
+      <ItemList
+        title="Missing information & assumptions"
+        tone="slate"
+        items={[...asArray(result?.missing_information ?? result?.missing_info), ...asArray(result?.assumptions)]}
+        evidenceIndex={evidenceIndex}
+      />
+      {Object.keys(extra).length > 0 && (
+        <Section title="Other details">
+          <JsonBlock value={extra} />
+        </Section>
+      )}
+      <Artifacts artifacts={task.artifacts ?? []} />
+      <Evidence evidence={task.evidence ?? []} />
+    </div>
   )
 }
 

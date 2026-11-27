@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 from backend.app.api.runtime import TaskRuntime
 from backend.app.api.routes.conversation import ConversationReply
-from backend.app.llm.provider import LLMProviderError, OpenAICompatibleProvider
+from backend.app.llm.provider import LLMConfigurationError, LLMProviderError, OllamaNativeProvider, OpenAICompatibleProvider
 from backend.app.main import create_app
 from backend.app.orchestrator.planner import PlanDraft
 
@@ -24,7 +24,7 @@ def test_ollama_conversation_uses_existing_provider(monkeypatch):
         calls.append({"url": url, "body": json, "headers": headers, "timeout": timeout})
         return httpx.Response(
             200,
-            json={"choices": [{"finish_reason": "stop", "message": {"content": "Hello from the local model."}}]},
+            json={"model": "qwen3.5:4b", "done": True, "done_reason": "stop", "message": {"role": "assistant", "content": "Hello from the local model."}},
             request=httpx.Request("POST", url),
         )
 
@@ -33,14 +33,46 @@ def test_ollama_conversation_uses_existing_provider(monkeypatch):
 
     assert response.status_code == 200
     assert response.json() == {"reply": "Hello from the local model."}
-    assert calls[0]["url"] == "http://localhost:11434/v1/chat/completions"
+    assert calls[0]["url"] == "http://localhost:11434/api/chat"
     assert calls[0]["body"]["model"] == "qwen3.5:4b"
-    assert "response_format" not in calls[0]["body"]
-    assert calls[0]["body"]["max_tokens"] == 256
-    assert calls[0]["body"]["reasoning_effort"] == "none"
+    assert calls[0]["body"]["stream"] is False
+    assert calls[0]["body"]["think"] is False
+    assert calls[0]["body"]["options"]["num_predict"] == 256
+    assert "reasoning_effort" not in calls[0]["body"]
     assert calls[0]["headers"].get("Authorization") is None
     assert calls[0]["timeout"].read == 90
     assert calls[0]["timeout"].connect == 5
+
+
+def test_ollama_configuration_rejects_an_openai_endpoint_path(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "ollama")
+    monkeypatch.setenv("LLM_MODEL", "qwen3.5:4b")
+    monkeypatch.setenv("LLM_BASE_URL", "http://localhost:11434/v1/chat/completions")
+    with pytest.raises(LLMConfigurationError, match="Ollama server URL"):
+        from backend.app.llm.provider import get_provider_from_env
+        get_provider_from_env()
+
+
+def test_native_ollama_unknown_model_error_is_actionable_without_echoing_body(caplog, monkeypatch):
+    private_prompt = "private synthetic document contents"
+
+    def missing_model(url, *, json, headers, timeout):
+        return httpx.Response(
+            400,
+            json={"error": "model 'not-installed:latest' not found; " + private_prompt},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx, "post", missing_model)
+    provider = OllamaNativeProvider(base_url="http://localhost:11434/v1", model="not-installed:latest")
+    with pytest.raises(LLMProviderError) as error:
+        provider.generate_text(system="system", prompt=private_prompt, max_tokens=64)
+
+    assert error.value.public_message == "Ollama rejected the request (HTTP 400): The configured Ollama model was not found."
+    assert "model_unavailable" in caplog.text
+    assert "provider_error_body_sha256=" in caplog.text
+    assert private_prompt not in caplog.text
+    assert private_prompt not in error.value.public_message
 
 
 def test_ollama_structured_requests_send_the_exact_pydantic_json_schema(monkeypatch):
@@ -62,23 +94,20 @@ def test_ollama_structured_requests_send_the_exact_pydantic_json_schema(monkeypa
         calls.append(json)
         return httpx.Response(
             200,
-            json={"choices": [{"finish_reason": "stop", "message": {"content": draft_json}}]},
+            json={"model": "qwen3.5:4b", "done": True, "done_reason": "stop", "message": {"role": "assistant", "content": draft_json}},
             request=httpx.Request("POST", url),
         )
 
     monkeypatch.setattr(httpx, "post", response_for)
-    provider = OpenAICompatibleProvider(
-        base_url="http://localhost:11434/v1", model="qwen3.5:4b", provider_name="ollama"
-    )
+    provider = OllamaNativeProvider(base_url="http://localhost:11434/v1", model="qwen3.5:4b")
     draft = provider.generate_json(
-        system="synthetic planner prompt", prompt="synthetic task", response_model=PlanDraft
+        system="synthetic planner prompt", prompt="synthetic task", response_model=PlanDraft, max_tokens=1024
     )
 
     assert isinstance(draft, PlanDraft)
-    assert calls[0]["response_format"] == {
-        "type": "json_schema",
-        "json_schema": {"schema": PlanDraft.model_json_schema()},
-    }
+    assert calls[0]["format"] == PlanDraft.model_json_schema()
+    assert calls[0]["think"] is False
+    assert calls[0]["options"]["num_predict"] == 1024
 
 
 def test_conversation_provider_unavailable_returns_safe_503():
@@ -91,6 +120,37 @@ def test_conversation_provider_unavailable_returns_safe_503():
     assert response.status_code == 503
     assert response.json()["detail"]["code"] == "llm_provider_error"
     assert "private connection detail" not in response.text
+
+
+def test_ollama_http_400_reports_safe_provider_diagnostics_without_prompt_leak(caplog, monkeypatch):
+    private_prompt = "private uploaded content must never appear in logs"
+
+    def rejected(url, *, json, headers, timeout):
+        assert url == "http://localhost:11434/api/chat"
+        assert json["messages"][-1]["content"] == private_prompt
+        return httpx.Response(
+            400,
+            json={"error": f"unknown parameter 'think'; request={private_prompt}"},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx, "post", rejected)
+    provider = OllamaNativeProvider(base_url="http://localhost:11434/v1", model="qwen3.5:4b")
+    with pytest.raises(LLMProviderError) as error:
+        provider.generate_text(
+            system="system", prompt=private_prompt, max_tokens=32, reasoning_effort="none"
+        )
+
+    assert error.value.public_message == (
+        "Ollama rejected the request (HTTP 400): Ollama rejected request parameter 'think'."
+    )
+    assert "provider_error_category=request_parameter_rejected" in caplog.text
+    assert "provider_error_summary=\"Ollama rejected request parameter 'think'.\"" in caplog.text
+    assert "provider_error_body_sha256=" in caplog.text
+    assert "request_roles=system,user" in caplog.text
+    assert "num_predict=32" in caplog.text
+    assert "response_format=none" in caplog.text
+    assert private_prompt not in caplog.text
 
 
 def test_empty_conversation_message_is_rejected():
@@ -167,7 +227,7 @@ def test_transient_http_503_retries_once_and_recovers(caplog, monkeypatch):
             return httpx.Response(503, request=httpx.Request("POST", url))
         return httpx.Response(
             200,
-            json={"choices": [{"finish_reason": "stop", "message": {"content": "Recovered."}}]},
+            json={"model": "qwen3.5:4b", "done": True, "done_reason": "stop", "message": {"role": "assistant", "content": "Recovered."}},
             request=httpx.Request("POST", url),
         )
 
@@ -201,7 +261,7 @@ def test_malformed_response_is_not_retried(monkeypatch):
 
     def malformed(url, *, json, headers, timeout):
         calls.append(1)
-        return httpx.Response(200, json={"choices": []}, request=httpx.Request("POST", url))
+        return httpx.Response(200, json={"model": "qwen3.5:4b", "done": True, "message": {}}, request=httpx.Request("POST", url))
 
     response = ollama_client(monkeypatch, malformed).post("/api/conversation", json={"message": "Hello"})
     assert response.status_code == 503
@@ -217,7 +277,7 @@ def test_successful_conversation_after_persistent_transient_failure(monkeypatch)
             return httpx.Response(503, request=httpx.Request("POST", url))
         return httpx.Response(
             200,
-            json={"choices": [{"finish_reason": "stop", "message": {"content": "Recovered on a new request."}}]},
+            json={"model": "qwen3.5:4b", "done": True, "done_reason": "stop", "message": {"role": "assistant", "content": "Recovered on a new request."}},
             request=httpx.Request("POST", url),
         )
 
@@ -239,7 +299,7 @@ def test_success_after_failed_exchange_and_duplicate_request_do_not_duplicate_hi
             return httpx.Response(503, request=httpx.Request("POST", url))
         return httpx.Response(
             200,
-            json={"choices": [{"finish_reason": "stop", "message": {"content": "Synthetic answer."}}]},
+            json={"model": "qwen3.5:4b", "done": True, "done_reason": "stop", "message": {"role": "assistant", "content": "Synthetic answer."}},
             request=httpx.Request("POST", url),
         )
 
@@ -259,9 +319,10 @@ def test_success_after_failed_exchange_and_duplicate_request_do_not_duplicate_hi
 @pytest.mark.parametrize(
     ("payload", "expected_log"),
     [
-        ({"choices": []}, "unexpected_response_structure"),
-        ({"choices": [{"finish_reason": "stop", "message": {"content": ""}}]}, "empty_message_content"),
-        ({"choices": [{"finish_reason": "length", "message": {"content": "{\\\"reply\\\":\\\"partial"}}]}, "generation_limit_reached"),
+        ({"model": "qwen3.5:4b", "done": True, "message": {}}, "unexpected_response_structure"),
+        ({"model": "qwen3.5:4b", "done": False, "message": {"role": "assistant", "content": "not final"}}, "unexpected_response_structure"),
+        ({"model": "qwen3.5:4b", "done": True, "message": {"role": "assistant", "content": ""}}, "empty_message_content"),
+        ({"model": "qwen3.5:4b", "done": True, "done_reason": "length", "message": {"role": "assistant", "content": "partial"}}, "generation_limit_reached"),
     ],
 )
 def test_malformed_empty_and_exhausted_responses_fail_safely(caplog, monkeypatch, payload, expected_log):

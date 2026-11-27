@@ -29,6 +29,9 @@ export function createLiveState() {
     execution: null,
     verification: null,
     error: null,
+    executionStage: null,
+    pageTitle: null,
+    provider: null,
     lastEventAt: null,
   }
 }
@@ -41,6 +44,15 @@ function applyEvent(prev, ev) {
   const next = { ...prev }
   next.lastEventAt = Math.max(prev.lastEventAt ?? 0, ev.time)
   next.sessionId = prev.sessionId ?? ev.session_id
+  if (ev.metadata?.stage && isNewer(prev.executionStage, ev.time)) {
+    next.executionStage = { stage: ev.metadata.stage, description: ev.description, time: ev.time }
+  }
+  if (ev.metadata?.page_title && isNewer(prev.pageTitle, ev.time)) {
+    next.pageTitle = { title: ev.metadata.page_title, time: ev.time }
+  }
+  if (ev.metadata?.provider && isNewer(prev.provider, ev.time)) {
+    next.provider = { name: ev.metadata.provider, time: ev.time }
+  }
 
   if (ev.screenshot && (!prev.screenshot || ev.screenshot.captured_at >= prev.screenshot.captured_at)) {
     next.screenshot = { ...ev.screenshot, event_id: ev.event_id }

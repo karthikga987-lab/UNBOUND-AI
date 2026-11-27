@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { api } from '../../api'
 import { canExecute } from '../../api/contracts'
@@ -14,7 +14,9 @@ vi.mock('../../api', () => ({
 }))
 
 vi.mock('../../hooks/useTask', () => ({ useTask: vi.fn() }))
-vi.mock('../live/LiveView', () => ({ default: () => null }))
+vi.mock('../live/LiveView', () => ({ default: ({ task, taskEvents }) => (
+  <div data-testid="live-view-status">{task.status} {taskEvents.map((event) => event.message).join(' ')}</div>
+) }))
 
 afterEach(() => {
   cleanup()
@@ -73,5 +75,78 @@ describe('TaskWorkspace approval continuation', () => {
   it('does not offer generic execution for needs-attention tasks', () => {
     expect(canExecute('needs_attention')).toBe(false)
     expect(canExecute('created')).toBe(true)
+  })
+
+  it('shows balanced Results and scrollable chronological Activity panels below the plan', () => {
+    const taskId = 'd438eaa3-e838-442c-9f81-efc74ab2f4fa'
+    const task = {
+      task_id: taskId,
+      user_request: 'Summarize a verified page',
+      status: 'completed',
+      plan: [],
+      pending_approvals: [],
+      completed_steps: [],
+      evidence: [],
+      artifacts: [],
+      result: { summary: 'A short verified result.' },
+    }
+    const events = [
+      { event_id: 'activity-1', timestamp: '2026-11-27T10:00:00Z', event_type: 'task_started', message: 'Task started', status: 'running' },
+      { event_id: 'activity-2', timestamp: '2026-11-27T10:00:02Z', event_type: 'task_completed', message: 'Task completed', status: 'completed' },
+    ]
+    useTask.mockReturnValue({ task, events, error: null, refresh: vi.fn(), setTask: vi.fn() })
+
+    render(<TaskWorkspace taskId={taskId} onTaskChange={vi.fn()} />)
+
+    const grid = screen.getByTestId('results-activity-grid')
+    expect(grid.className).toContain('lg:grid-cols-2')
+    expect(screen.getByRole('heading', { name: 'Results' })).toBeTruthy()
+    expect(screen.getByRole('heading', { name: 'Activity' })).toBeTruthy()
+    const activityRegion = screen.getByRole('region', { name: 'Activity events' })
+    expect(activityRegion.tabIndex).toBe(0)
+    expect(activityRegion.className).toContain('max-h-80')
+    const items = screen.getAllByTestId('activity-item')
+    expect(items).toHaveLength(2)
+    expect(items[0].textContent).toContain('Task started')
+    expect(items[1].textContent).toContain('Task completed')
+    expect(screen.getByRole('button', { name: 'View full result' })).toBeTruthy()
+  })
+
+  it('runs the selected saved plan once and opens live task status', async () => {
+    const taskId = '480312ac-4245-4abf-a1bd-1f06da43aac9'
+    const initial = {
+      task_id: taskId,
+      user_request: 'Open the approved page and summarize it',
+      status: 'created',
+      plan: [],
+      pending_approvals: [],
+      completed_steps: [],
+      evidence: [],
+      artifacts: [],
+    }
+    const running = { ...initial, status: 'running' }
+    let finish
+    api.executeTask.mockReturnValueOnce(new Promise((resolve) => { finish = resolve }))
+    useTask.mockReturnValue({
+      task: initial,
+      events: [{ event_id: 'event-1', message: 'Browser navigation started', status: 'running' }],
+      error: null,
+      refresh: vi.fn().mockResolvedValue(running),
+      setTask: vi.fn((updated) => Object.assign(initial, updated)),
+    })
+    render(<TaskWorkspace taskId={taskId} onTaskChange={vi.fn()} />)
+
+    const runButton = screen.getByRole('button', { name: 'Run plan' })
+    act(() => {
+      runButton.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      runButton.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+
+    expect(api.executeTask).toHaveBeenCalledTimes(1)
+    expect(api.executeTask).toHaveBeenCalledWith(taskId)
+    expect(screen.getByRole('tab', { name: 'Live View' }).getAttribute('aria-selected')).toBe('true')
+    await act(async () => { finish(running) })
+    await waitFor(() => expect(screen.getByTestId('live-view-status').textContent).toContain('running'))
+    expect(screen.getByTestId('live-view-status').textContent).toContain('Browser navigation started')
   })
 })

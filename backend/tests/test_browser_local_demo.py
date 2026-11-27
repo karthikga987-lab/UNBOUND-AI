@@ -1,16 +1,29 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
+import socket
 import urllib.error
 import urllib.request
 from uuid import uuid4
+
+import pytest
 
 from backend.app.api.runtime import TaskRuntime
 from backend.app.main import create_app
 from backend.app.browser.egress import LOCAL_DEMO_PRODUCT_URL, LocalEgressProxy
 from backend.app.browser.tools import BrowserClickInput, BrowserFillInput, BrowserNavigateInput
 from backend.app.schemas.contracts import EvidenceItem, EvidenceSourceType, TaskCreateRequest, TaskStep, TaskStatus, ToolCall
+
+
+def _use_temporary_egress_port(monkeypatch):
+    # The repository may be tested while the live demo proxy is still running
+    # on the fixed production port. Isolate each test-owned child process.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        port = reservation.getsockname()[1]
+    monkeypatch.setenv("UNBOUND_BROWSER_EGRESS_PORT", str(port))
 
 
 def _proxy_request(proxy: LocalEgressProxy, url: str) -> tuple[int, str]:
@@ -57,6 +70,7 @@ def test_local_demo_proxy_serves_only_fixed_synthetic_pages():
 def test_runtime_local_demo_gate_allows_only_fixed_navigation_and_details_click(monkeypatch, tmp_path):
     monkeypatch.setenv("UNBOUND_BROWSER_LOCAL_DEMO", "1")
     monkeypatch.setenv("UNBOUND_BROWSER_LOCAL_DEMO_HEADLESS", "1")
+    _use_temporary_egress_port(monkeypatch)
     monkeypatch.setenv("BROWSER_REPLAY_STATE_KEY", "test:" + base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("="))
     monkeypatch.setenv("UNBOUND_BROWSER_WORKFLOW_DIR", str(tmp_path / "workflows"))
     runtime = TaskRuntime()
@@ -93,7 +107,11 @@ def test_runtime_local_demo_gate_allows_only_fixed_navigation_and_details_click(
         runtime.shutdown()
 
 
-def test_assistant_prepares_fixed_local_demo_plan_without_llm_generated_targets(monkeypatch, tmp_path):
+@pytest.mark.parametrize("message", [
+    "Open the Demo Product page, click the View details link, and tell me its version and features.",
+    "Open the synthetic product page, click View details, and tell me the version and features listed there.",
+])
+def test_assistant_prepares_fixed_local_demo_plan_without_llm_generated_targets(monkeypatch, tmp_path, message):
     """The AI classifies the request; the opt-in fixture plan is server-bounded."""
     from fastapi.testclient import TestClient
     from backend.app.assistant.intent import AssistantIntent, AssistantIntentCategory
@@ -102,6 +120,7 @@ def test_assistant_prepares_fixed_local_demo_plan_without_llm_generated_targets(
     monkeypatch.setenv("UNBOUND_BROWSER_LOCAL_DEMO_HEADLESS", "1")
     monkeypatch.setenv("BROWSER_REPLAY_STATE_KEY", "test:" + base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("="))
     monkeypatch.setenv("UNBOUND_BROWSER_WORKFLOW_DIR", str(tmp_path / "workflows"))
+    _use_temporary_egress_port(monkeypatch)
     monkeypatch.setenv("UNBOUND_CONVERSATION_DB", str(tmp_path / "conversations.sqlite3"))
     monkeypatch.setenv("UNBOUND_DOCUMENT_STORAGE", str(tmp_path / "documents.sqlite3"))
     runtime = TaskRuntime()
@@ -116,7 +135,7 @@ def test_assistant_prepares_fixed_local_demo_plan_without_llm_generated_targets(
     )
     with TestClient(create_app(runtime)) as client:
         response = client.post("/api/assistant/requests", json={
-            "message": "Open the Demo Product page, click the View details link, and tell me its version and features."
+            "message": message
         })
     assert response.status_code == 200
     result = response.json()
@@ -136,6 +155,7 @@ def test_exact_local_demo_url_executes_through_assistant_api_and_executor(monkey
 
     monkeypatch.setenv("UNBOUND_BROWSER_LOCAL_DEMO", "1")
     monkeypatch.setenv("UNBOUND_BROWSER_LOCAL_DEMO_HEADLESS", "1")
+    _use_temporary_egress_port(monkeypatch)
     monkeypatch.setenv("BROWSER_REPLAY_STATE_KEY", "test:" + base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("="))
     monkeypatch.setenv("UNBOUND_BROWSER_WORKFLOW_DIR", str(tmp_path / "workflows"))
     monkeypatch.setenv("UNBOUND_CONVERSATION_DB", str(tmp_path / "conversations.sqlite3"))
@@ -202,6 +222,7 @@ def test_local_demo_plan_never_rewrites_an_explicit_external_url(monkeypatch, tm
 
     monkeypatch.setenv("UNBOUND_BROWSER_LOCAL_DEMO", "1")
     monkeypatch.setenv("UNBOUND_BROWSER_LOCAL_DEMO_HEADLESS", "1")
+    _use_temporary_egress_port(monkeypatch)
     monkeypatch.setenv("BROWSER_REPLAY_STATE_KEY", "test:" + base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("="))
     monkeypatch.setenv("UNBOUND_BROWSER_WORKFLOW_DIR", str(tmp_path / "workflows"))
     runtime = TaskRuntime()
@@ -218,6 +239,7 @@ def test_real_chromium_local_demo_runs_through_task_executor_and_synthesis(monke
     """Real Chromium task execution plus mocked synthesis; not a public-egress test."""
     monkeypatch.setenv("UNBOUND_BROWSER_LOCAL_DEMO", "1")
     monkeypatch.setenv("UNBOUND_BROWSER_LOCAL_DEMO_HEADLESS", "1")
+    _use_temporary_egress_port(monkeypatch)
     monkeypatch.setenv("BROWSER_REPLAY_STATE_KEY", "test:" + base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("="))
     monkeypatch.setenv("UNBOUND_BROWSER_WORKFLOW_DIR", str(tmp_path / "workflows"))
     monkeypatch.setenv("UNBOUND_BROWSER_DOWNLOAD_DIR", str(tmp_path / "downloads"))
@@ -252,8 +274,42 @@ def test_real_chromium_local_demo_runs_through_task_executor_and_synthesis(monke
         assert observations[1]["url"].endswith("/details")
         assert "Version: 2.1" in observations[1]["visible_text"]
         assert "document search, task planning, evidence summaries" in observations[1]["visible_text"]
+        screenshot = base64.b64decode(observations[1]["screenshot_base64"], validate=True)
+        assert screenshot.startswith(b"\x89PNG\r\n\x1a\n")
+        assert observations[1]["screenshot_format"] == "image/png"
+        assert observations[1]["screenshot_sha256"] == hashlib.sha256(screenshot).hexdigest()
         assert all(step.verification["verified"] is True for step in result.plan)
-        assert len(result.evidence) == 2
+        assert len(result.evidence) == 3
+        assert result.evidence[2].source_name == "Local Demo PNG screenshot"
+        execution_events = runtime.manager.events(task.task_id)
+        event_types = [event.event_type for event in execution_events]
+        for expected_event in (
+            "browser.launch_started",
+            "browser.launch_completed",
+            "browser.navigation_started",
+            "browser.navigation_completed",
+            "browser.results_extracted",
+            "browser.screenshot_captured",
+            "verification.started",
+            "step.verified",
+            "task.persistence_completed",
+            "browser.termination_started",
+            "browser.termination_completed",
+        ):
+            assert expected_event in event_types
+        termination_event = next(
+            event for event in execution_events
+            if event.event_type == "browser.termination_completed"
+        )
+        assert termination_event.status.value == "completed"
+        assert runtime.manager.get(task.task_id).status == TaskStatus.COMPLETED
+        screenshot_event = next(
+            event for event in execution_events
+            if event.event_type == "browser.screenshot_captured" and event.step_id == "details"
+        )
+        assert screenshot_event.screenshot_reference == f"sha256:{observations[1]['screenshot_sha256']}"
+        assert screenshot_event.browser_session_id
+        assert screenshot_event.tool_name == "browser.click"
 
         class LocalSummaryProvider:
             provider_name = "ollama"

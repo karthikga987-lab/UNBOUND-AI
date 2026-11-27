@@ -47,7 +47,7 @@ export function openLiveConnection({ transport, url, taskId, onEvents, onStatus,
     current = status
     onStatus(status)
   }
-  const currentUrl = () => buildUrl(url, { task_id: taskId, after: lastSequence ?? '' })
+  const currentUrl = () => buildUrl(url, { task_id: taskId, after: lastSequence ?? 0 })
 
   function detachSocket() {
     if (!socket) return
@@ -75,7 +75,7 @@ export function openLiveConnection({ transport, url, taskId, onEvents, onStatus,
     if (!events.length) return
     for (const ev of events) {
       if (Number.isInteger(ev?.sequence)) lastSequence = Math.max(lastSequence ?? ev.sequence, ev.sequence)
-      if (ev?.event_type === 'session_ended') ended = true
+      if (['session_ended', 'completed', 'failed', 'cancelled'].includes(ev?.event_type)) ended = true
     }
     onEvents(events)
     if (ended) {

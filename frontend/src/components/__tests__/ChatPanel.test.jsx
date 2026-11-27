@@ -1,4 +1,4 @@
-import { act, cleanup, render } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 const state = vi.hoisted(() => ({ onUtterance: null, executeTask: vi.fn() }))
@@ -50,5 +50,17 @@ describe('voice task handoff', () => {
     expect(state.executeTask).not.toHaveBeenCalled()
     expect(reply).toMatch(/needs your attention/i)
     expect(reply).toMatch(/will not retry/i)
+  })
+
+  it('submits an actionable chat request only once while the response is pending', async () => {
+    let finish
+    const onSubmit = vi.fn(() => new Promise((resolve) => { finish = resolve }))
+    render(<ChatPanel history={[]} onSubmit={onSubmit} />)
+    fireEvent.change(screen.getByPlaceholderText(/describe an action/i), { target: { value: 'Search the web for the approved page' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    fireEvent.click(screen.getByRole('button', { name: /thinking/i }))
+
+    expect(onSubmit).toHaveBeenCalledTimes(1)
+    await act(async () => { finish({ reply: 'Plan ready' }) })
   })
 })

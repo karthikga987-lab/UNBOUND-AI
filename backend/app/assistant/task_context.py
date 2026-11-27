@@ -20,6 +20,10 @@ _DOCUMENT_FOLLOWUP = re.compile(
     r"\b(document|file|evidence|excerpt|quotation|quote|source|accuracy|claim|finding|findings|limitation|methodology|conclusion|prove|proves|support(?:s|ed)?)\b",
     re.I,
 )
+_BROWSER_REQUEST = re.compile(
+    r"\b(?:browser(?:less)?|website|webpage|web\s+page|browse|navigate|visit)\b|https?://",
+    re.I,
+)
 _FILENAME_REFERENCE = re.compile(r"\b[\w.-]+\.(?:pdf|docx|txt)\b", re.I)
 
 
@@ -39,7 +43,8 @@ def is_local_ollama_provider(provider: Any) -> bool:
 def _verified_document_payload(task: Any) -> dict[str, Any] | None:
     if task.status != TaskStatus.COMPLETED:
         return None
-    step = next((item for item in task.plan if item.tool_name == "document.read_local_file"), None)
+    supported_tools = {"document.read_local_file", "document.analyze_uploaded"}
+    step = next((item for item in task.plan if item.tool_name in supported_tools), None)
     if step is None:
         return None
     result = task.result if isinstance(task.result, dict) else {}
@@ -148,7 +153,10 @@ def resolve_document_followup(runtime: Any, session_id: UUID | None, message: st
     This only reads TaskManager records and persisted task references. It never
     opens a file or authorizes a new task.
     """
-    if session_id is None or not _DOCUMENT_FOLLOWUP.search(message):
+    # Browser requests commonly mention evidence, sources, and excerpts too.
+    # Those generic words must not attach a prior local-document result to a
+    # new web task in the same conversation.
+    if session_id is None or _BROWSER_REQUEST.search(message) or not _DOCUMENT_FOLLOWUP.search(message):
         return None
     task_ids = runtime.conversation_store.get_task_ids(session_id)
     if not task_ids:

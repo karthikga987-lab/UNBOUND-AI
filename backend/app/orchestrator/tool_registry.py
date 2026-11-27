@@ -9,14 +9,14 @@ from typing import Any, Callable
 from pydantic import BaseModel, ValidationError
 
 from backend.app.safety.permissions import action_requires_approval
-from backend.app.schemas.contracts import ApprovalRequest, ApprovalStatus, ToolCall, ToolDefinition, ToolResult
+from backend.app.schemas.contracts import ApprovalRequest, ApprovalStatus, TaskStep, ToolCall, ToolDefinition, ToolResult
 
 logger = logging.getLogger(__name__)
 
 
 AGREED_TOOL_NAMES = frozenset({
     "browser.navigate", "browser.click", "browser.fill", "browser.record", "browser.replay", "browser.download",
-    "document.upload", "document.search", "document.read_local_file", "context.retrieve", "context.relate", "report.generate",
+    "document.upload", "document.search", "document.read_local_file", "document.analyze_uploaded", "context.retrieve", "context.relate", "report.generate",
 })
 
 
@@ -25,7 +25,10 @@ class ToolUnavailableError(LookupError):
 
 
 class ToolInputError(ValueError):
-    pass
+    def __init__(self, message: str, *, missing_fields: tuple[str, ...] = (), extra_fields: tuple[str, ...] = ()) -> None:
+        super().__init__(message)
+        self.missing_fields = missing_fields
+        self.extra_fields = extra_fields
 
 
 class ApprovalRequiredError(PermissionError):
@@ -38,6 +41,10 @@ class ToolExecutionCancelled(RuntimeError):
 
 class ToolExecutionOutcomeUnknown(RuntimeError):
     """The callable ran, but its external outcome cannot be established safely."""
+
+
+class ToolResponsePersistenceError(ToolExecutionOutcomeUnknown):
+    """The tool returned, but its diagnostic checkpoint could not be saved."""
 
 
 ToolCallable = Callable[[BaseModel, ToolCall], ToolResult | dict[str, Any]]
@@ -120,8 +127,60 @@ class ToolRegistry:
         try:
             return registration.input_model.model_validate(value)
         except ValidationError as exc:
-            fields = sorted({".".join(str(part) for part in error["loc"]) for error in exc.errors(include_input=False)})
-            raise ToolInputError(f"Invalid input for '{name}' (fields: {', '.join(fields) or 'unknown'})") from exc
+            errors = exc.errors(include_input=False)
+            fields = sorted({".".join(str(part) for part in error["loc"]) for error in errors})
+            missing = tuple(sorted({".".join(str(part) for part in error["loc"]) for error in errors if error["type"] == "missing"}))
+            extra = tuple(sorted({".".join(str(part) for part in error["loc"]) for error in errors if error["type"] == "extra_forbidden"}))
+            raise ToolInputError(
+                f"Invalid input for '{name}' (fields: {', '.join(fields) or 'unknown'})",
+                missing_fields=missing,
+                extra_fields=extra,
+            ) from exc
+
+    def normalize_step_metadata(self, step: TaskStep) -> bool:
+        """Move misplaced orchestration metadata out of a step's tool input.
+
+        Some planner responses serialize a whole step into ``input``.  Keep
+        recognized metadata on ``TaskStep`` and ensure only registered tool
+        fields can reach a callable. Unknown non-metadata arguments remain in
+        ``input`` so normal schema validation rejects them rather than silently
+        dropping them.
+        """
+        registration = self._get_registration(step.tool_name)
+        properties = registration.definition.input_schema.get("properties", {})
+        if not isinstance(properties, dict):
+            properties = {}
+        arguments = dict(step.input)
+        changed = False
+
+        # A key that is genuinely part of a tool's schema remains a tool
+        # argument. Otherwise these names belong to TaskStep orchestration.
+        if "depends_on" in arguments and "depends_on" not in properties:
+            nested = arguments.pop("depends_on")
+            if not isinstance(nested, list) or any(not isinstance(item, str) or not item for item in nested):
+                raise ToolInputError(f"Invalid step metadata for '{step.tool_name}' (field: depends_on)")
+            step.depends_on = list(dict.fromkeys([*step.depends_on, *nested]))
+            changed = True
+        if "requires_approval" in arguments and "requires_approval" not in properties:
+            nested = arguments.pop("requires_approval")
+            if not isinstance(nested, bool):
+                raise ToolInputError(f"Invalid step metadata for '{step.tool_name}' (field: requires_approval)")
+            # A nested false value must never weaken an explicit top-level
+            # approval requirement.
+            step.requires_approval = step.requires_approval or nested
+            changed = True
+
+        # These are server-managed step fields, never browser arguments. Keep
+        # their canonical top-level fields intact, but do not import values
+        # from an untrusted planner's nested input object.
+        for name in ("error", "verification", "status"):
+            if name in arguments and name not in properties:
+                arguments.pop(name)
+                changed = True
+
+        if changed:
+            step.input = arguments
+        return changed
 
     def action_requires_approval(self, call: ToolCall, description: str = "") -> bool:
         definition = self.get_tool(call.tool_name)
@@ -140,6 +199,7 @@ class ToolRegistry:
         approval: ApprovalRequest | None = None,
         requires_approval: bool = False,
         before_execute: Callable[[], bool] | None = None,
+        on_raw_response: Callable[[Any], None] | None = None,
     ) -> ToolResult:
         registration = self._get_registration(call.tool_name)
         arguments = self.validate_input(call.tool_name, call.arguments)
@@ -160,6 +220,15 @@ class ToolRegistry:
             raise ToolExecutionOutcomeUnknown(
                 f"Tool invocation raised {type(exc).__name__}; its external outcome is unknown"
             ) from exc
+        if on_raw_response is not None:
+            try:
+                on_raw_response(raw_result)
+            except Exception:
+                # The operation has returned, but without its diagnostic
+                # checkpoint it must not advance to dependent steps.
+                raise ToolResponsePersistenceError(
+                    "Tool returned a response, but its diagnostic could not be persisted; review is required"
+                ) from None
         try:
             raw_value = raw_result.model_dump() if isinstance(raw_result, ToolResult) else raw_result
             validated = ToolResult.model_validate(raw_value)

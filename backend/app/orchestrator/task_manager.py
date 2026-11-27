@@ -21,6 +21,7 @@ from backend.app.safety.permissions import action_requires_approval
 from backend.app.schemas.contracts import (
     ApprovalRequest,
     ApprovalStatus,
+    BrowserDomainAuthorizationStatus,
     EventStatus,
     ExecutionEvent,
     StepStatus,
@@ -75,6 +76,7 @@ def normalize_task_id(task_id: UUID | str) -> UUID4:
 class InMemoryTaskRepository:
     def __init__(self) -> None:
         self._tasks: dict[UUID4, TaskResponse] = {}
+        self._tool_diagnostics: dict[tuple[UUID4, str], dict] = {}
         self._lock = RLock()
 
     def save(self, task: TaskResponse) -> TaskResponse:
@@ -94,6 +96,24 @@ class InMemoryTaskRepository:
             raise ValueError("limit must be between 1 and 500")
         with self._lock:
             return [task.model_copy(deep=True) for task in list(self._tasks.values())[-limit:]]
+
+    def save_tool_diagnostic(self, task_id: UUID4, step_id: str, tool_name: str, payload: dict) -> None:
+        with self._lock:
+            key = (task_id, step_id)
+            previous = self._tool_diagnostics.get(key, {})
+            checkpoints = list(previous.get("checkpoints", []))
+            safe_payload = json.loads(json.dumps(payload, allow_nan=False))
+            checkpoints.append(safe_payload)
+            self._tool_diagnostics[key] = {
+                **safe_payload,
+                "tool_name": tool_name,
+                "checkpoints": checkpoints,
+            }
+
+    def load_tool_diagnostic(self, task_id: UUID4, step_id: str) -> dict | None:
+        with self._lock:
+            value = self._tool_diagnostics.get((task_id, step_id))
+            return json.loads(json.dumps(value, allow_nan=False)) if value is not None else None
 
 
 def default_task_database_path() -> Path:
@@ -165,6 +185,14 @@ class SQLiteTaskRepository:
                     task_id TEXT PRIMARY KEY REFERENCES tasks(task_id) ON DELETE CASCADE,
                     payload TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS task_tool_diagnostics (
+                    task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+                    step_id TEXT NOT NULL,
+                    tool_name TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(task_id, step_id)
+                );
             """)
 
     def save(self, task: TaskResponse) -> TaskResponse:
@@ -226,6 +254,36 @@ class SQLiteTaskRepository:
         with self._lock, self._connection() as connection:
             row = connection.execute("SELECT payload FROM task_runtime_state WHERE task_id=?", (str(key),)).fetchone()
         return json.loads(row["payload"]) if row else {}
+
+    def save_tool_diagnostic(self, task_id: UUID | str, step_id: str, tool_name: str, payload: dict) -> None:
+        key = normalize_task_id(task_id)
+        safe_payload = json.loads(json.dumps(payload, ensure_ascii=False, allow_nan=False))
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT payload FROM task_tool_diagnostics WHERE task_id=? AND step_id=?",
+                (str(key), step_id),
+            ).fetchone()
+            previous = json.loads(row["payload"]) if row else {}
+            checkpoints = list(previous.get("checkpoints", []))
+            checkpoints.append(safe_payload)
+            stored_payload = {**safe_payload, "checkpoints": checkpoints}
+            serialized = json.dumps(stored_payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+            connection.execute(
+                "INSERT INTO task_tool_diagnostics(task_id,step_id,tool_name,payload,updated_at) VALUES(?,?,?,?,?) "
+                "ON CONFLICT(task_id,step_id) DO UPDATE SET tool_name=excluded.tool_name,payload=excluded.payload,updated_at=excluded.updated_at",
+                (str(key), step_id, tool_name, serialized, utc_now().isoformat()),
+            )
+
+    def load_tool_diagnostic(self, task_id: UUID | str, step_id: str) -> dict | None:
+        key = normalize_task_id(task_id)
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT tool_name,payload,updated_at FROM task_tool_diagnostics WHERE task_id=? AND step_id=?",
+                (str(key), step_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return {"tool_name": row["tool_name"], "updated_at": row["updated_at"], **json.loads(row["payload"])}
 
 
 class TaskManager:
@@ -326,6 +384,24 @@ class TaskManager:
                     event_saver(event)
                 self._events[key].append(event)
                 self._persist_runtime_state(key)
+            # Browserless permissions are process/session scoped. After a
+            # backend restart there is no matching live browser session, so a
+            # persisted grant is retained for audit but cannot remain active.
+            if task.browser_domain_authorization_status == BrowserDomainAuthorizationStatus.GRANTED:
+                task.browser_domain_authorization_status = BrowserDomainAuthorizationStatus.EXPIRED
+                task.updated_at = utc_now()
+                self.repository.save(task)
+                event = ExecutionEvent(
+                    task_id=key,
+                    event_type="browser.domains_authorization_expired",
+                    message="Task-scoped website permission expired when the backend session ended",
+                    status=EventStatus.COMPLETED,
+                )
+                event_saver = getattr(self.repository, "save_event", None)
+                if callable(event_saver):
+                    event_saver(event)
+                self._events[key].append(event)
+                self._persist_runtime_state(key)
 
     @contextmanager
     def execution_lock(self, task_id: UUID | str) -> Iterator[None]:
@@ -396,6 +472,7 @@ class TaskManager:
         request: TaskCreateRequest,
         steps: list[TaskStep],
         missing_information: list[str] | None = None,
+        browser_domain_policy: dict | None = None,
     ) -> TaskResponse:
         steps = [step.model_copy(deep=True) for step in steps]
         self._validate_unique_step_ids(steps)
@@ -407,7 +484,10 @@ class TaskManager:
         if not steps and not missing:
             missing.append("No executable steps were produced; clarify the requested action and prepare a valid plan.")
         status = TaskStatus.NEEDS_ATTENTION if missing else TaskStatus.CREATED
-        task = TaskResponse(task_id=task_id, user_request=request.user_request, status=status, plan=steps)
+        task = TaskResponse(
+            task_id=task_id, user_request=request.user_request, status=status, plan=steps,
+            **(browser_domain_policy or {}),
+        )
         if missing:
             task.result = {"missing_information": missing}
         with self._lock:
@@ -451,6 +531,15 @@ class TaskManager:
         message: str,
         step_id: str | None = None,
         evidence_ids: list[UUID4] | None = None,
+        *,
+        tool_name: str | None = None,
+        browser_session_id: str | None = None,
+        provider_session_id: str | None = None,
+        duration_ms: int | None = None,
+        result_count: int | None = None,
+        screenshot_reference: str | None = None,
+        error_category: str | None = None,
+        diagnostic: dict | None = None,
     ) -> ExecutionEvent:
         event = ExecutionEvent(
             task_id=task.task_id,
@@ -459,6 +548,14 @@ class TaskManager:
             message=message,
             status=status,
             evidence_ids=evidence_ids or [],
+            tool_name=tool_name,
+            browser_session_id=browser_session_id,
+            provider_session_id=provider_session_id,
+            duration_ms=duration_ms,
+            result_count=result_count,
+            screenshot_reference=screenshot_reference,
+            error_category=error_category,
+            diagnostic=diagnostic,
         )
         with self._lock:
             self._events.setdefault(task.task_id, []).append(event)
@@ -467,6 +564,48 @@ class TaskManager:
                 event_saver(event)
         self._persist_runtime_state(task.task_id)
         return event
+
+    def record_execution_event(
+        self,
+        task_id: UUID | str,
+        event_type: str,
+        status: EventStatus,
+        message: str,
+        *,
+        step_id: str | None = None,
+        tool_name: str | None = None,
+        browser_session_id: str | None = None,
+        provider_session_id: str | None = None,
+        duration_ms: int | None = None,
+        result_count: int | None = None,
+        screenshot_reference: str | None = None,
+        error_category: str | None = None,
+        diagnostic: dict | None = None,
+    ) -> ExecutionEvent:
+        task = self.get_for_execution(task_id)
+        return self.event(
+            task, event_type, status, message, step_id,
+            tool_name=tool_name,
+            browser_session_id=browser_session_id,
+            provider_session_id=provider_session_id,
+            duration_ms=duration_ms,
+            result_count=result_count,
+            screenshot_reference=screenshot_reference,
+            error_category=error_category,
+            diagnostic=diagnostic,
+        )
+
+    def record_tool_diagnostic(self, task_id: UUID | str, step_id: str, tool_name: str, diagnostic: dict) -> None:
+        key = normalize_task_id(task_id)
+        saver = getattr(self.repository, "save_tool_diagnostic", None)
+        if not callable(saver):
+            raise RuntimeError("Task repository does not support tool diagnostic persistence")
+        saver(key, step_id, tool_name, diagnostic)
+
+    def tool_diagnostic(self, task_id: UUID | str, step_id: str) -> dict | None:
+        key = normalize_task_id(task_id)
+        loader = getattr(self.repository, "load_tool_diagnostic", None)
+        return loader(key, step_id) if callable(loader) else None
 
     def events(self, task_id: UUID | str) -> list[ExecutionEvent]:
         key = normalize_task_id(task_id)
@@ -958,15 +1097,87 @@ class TaskManager:
         return self._save(task, public=False)
 
     def _save(self, task: TaskResponse, *, public: bool) -> TaskResponse:
+        authorization_expired = False
         with self._lock:
             current = self.repository.get(task.task_id)
             if current.status == TaskStatus.CANCELLED and task.status != TaskStatus.CANCELLED:
                 task.status = TaskStatus.CANCELLED
+            if (
+                task.status in {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.NEEDS_ATTENTION, TaskStatus.CANCELLED}
+                and task.browser_domain_authorization_status == BrowserDomainAuthorizationStatus.GRANTED
+            ):
+                task.browser_domain_authorization_status = BrowserDomainAuthorizationStatus.EXPIRED
+                authorization_expired = True
             task.updated_at = utc_now()
             saved = self.repository.save(task)
             self._persist_runtime_state(task.task_id)
+        if authorization_expired:
+            expiry_status = EventStatus.CANCELLED if saved.status == TaskStatus.CANCELLED else EventStatus.COMPLETED
+            self.event(
+                saved, "browser.domains_authorization_expired", expiry_status,
+                "Task-scoped website permission expired when the task ended",
+            )
         self.notify_task_terminal(task.task_id)
         return self._public_task(saved) if public else saved
+
+    def authorize_browser_domains(self, task_id: UUID | str, *, baseline: list[str], requested: list[str]) -> TaskResponse:
+        """Persist the reviewed exact-host grant immediately before Run plan dispatch."""
+        key = normalize_task_id(task_id)
+        baseline_hosts = sorted(set(baseline))
+        requested_hosts = sorted(set(requested))
+        with self._lock:
+            task = self.repository.get(key)
+            if task.status not in {TaskStatus.CREATED, TaskStatus.AWAITING_APPROVAL}:
+                raise ValueError("Browser domain authorization requires a runnable, nonterminal task")
+            if requested_hosts != sorted(set(task.requested_browser_domains)):
+                raise ValueError("Browser domain authorization no longer matches the reviewed plan")
+            task.baseline_browser_domains = baseline_hosts
+            task.authorized_browser_domains = requested_hosts
+            task.browser_domain_authorization_status = (
+                BrowserDomainAuthorizationStatus.GRANTED if requested_hosts
+                else BrowserDomainAuthorizationStatus.NOT_APPLICABLE
+            )
+            task.browser_domain_authorized_at = utc_now() if requested_hosts else None
+            task.updated_at = utc_now()
+            saved = self.repository.save(task)
+            self._persist_runtime_state(key)
+        if requested_hosts:
+            extras = sorted(set(requested_hosts) - set(baseline_hosts))
+            self.event(
+                saved, "browser.domains_authorized", EventStatus.CREATED,
+                "Run plan authorized the displayed exact website hosts for this task only",
+                diagnostic={
+                    "baseline_hosts": baseline_hosts,
+                    "task_requested_hosts": requested_hosts,
+                    "task_specific_hosts": extras,
+                    "enforcement": "browserless_application_request_interception",
+                },
+            )
+        return self._public_task(saved)
+
+    def deny_browser_domains(self, task_id: UUID | str, *, category: str) -> TaskResponse:
+        """Persist a failed domain preflight without dispatching browser actions."""
+        key = normalize_task_id(task_id)
+        with self._lock:
+            task = self.repository.get(key)
+            if task.status not in {TaskStatus.CREATED, TaskStatus.AWAITING_APPROVAL}:
+                return self._public_task(task)
+            task.authorized_browser_domains = []
+            task.browser_domain_authorization_status = BrowserDomainAuthorizationStatus.DENIED
+            task.browser_domain_authorized_at = None
+            task.status = TaskStatus.NEEDS_ATTENTION
+            task.error = "Website access could not be authorized safely; no browser action was dispatched"
+            task.updated_at = utc_now()
+            saved = self.repository.save(task)
+            self._persist_runtime_state(key)
+        self.event(
+            saved, "browser.domains_denied", EventStatus.NEEDS_ATTENTION,
+            "Website authorization preflight failed; no browser action was dispatched",
+            error_category=category,
+            diagnostic={"requested_hosts": sorted(set(saved.requested_browser_domains))},
+        )
+        self.notify_task_terminal(key)
+        return self._public_task(saved)
 
     def get(self, task_id: UUID | str) -> TaskResponse:
         return self._public_task(self.repository.get(task_id))

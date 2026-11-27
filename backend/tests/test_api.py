@@ -12,6 +12,7 @@ from pydantic import BaseModel, ValidationError
 import pytest
 
 from backend.app.api.runtime import TaskRuntime
+from backend.app.browser.tools import BrowserClickInput
 from backend.app.assistant.intent import AssistantIntent, AssistantIntentCategory
 from backend.app.llm.provider import LLMConfigurationError, LLMProviderError, LLMResponseFormatError
 from backend.app.main import create_app
@@ -86,7 +87,11 @@ def test_application_starts_without_llm_credentials_and_health_is_honest(monkeyp
     monkeypatch.delenv("LLM_PROVIDER", raising=False)
     monkeypatch.delenv("LLM_MODEL", raising=False)
     monkeypatch.setenv("UNBOUND_S3_SYNC_ENABLED", "0")
-    client = TestClient(create_app())
+    application = create_app()
+    # Runtime-local mutable state is not sufficient evidence to enable public
+    # browsing; health remains fail-closed until OS containment is verified.
+    application.state.runtime.browser_egress_security_enabled = True
+    client = TestClient(application)
     response = client.get("/api/health")
     assert response.status_code == 200
     chromium_path, chromium_hash = _chromium_binary_identity()
@@ -95,11 +100,46 @@ def test_application_starts_without_llm_credentials_and_health_is_honest(monkeyp
         "status": "ok",
         "llm_configured": False,
         "tools_registered": True,
-        "registered_tools_count": 4,
+        "registered_tools_count": 5,
         "notification_agent_installed": False,
         "notification_agent_running": False,
         "browser_public_execution_enabled": False,
+        "browser_worker": {
+            "installation": "unknown", "service": "unknown", "connection": "untested",
+            "guest_proxy": "unavailable",
+            "readiness_gates": {"A": "NOT TESTED", "B": "NOT TESTED", "C": "NOT TESTED",
+                                "D": "FAIL", "E": "FAIL", "F": "FAIL",
+                                "G": "NOT TESTED", "H": "NOT TESTED", "I": "FAIL"},
+            "configured": False,
+            "reachable": False,
+            "authenticated": False,
+            "containment_verified": False,
+            "guest_policy_verified": False,
+            "guest_policy_failure": "guest_policy_attestation_missing",
+            "guest_policy_attestation": None,
+            "execution_enabled": False,
+            "worker_id": None,
+            "last_health_check": None,
+            "failure_category": "not_integrated",
+            "allowed_domains": ["example.com", "www.python.org", "docs.python.org"],
+            "fetch_gateway_active": False,
+            "public_browsing_enabled": False,
+        },
         "browser_integration_status": "not_initialized",
+        "browser_provider_mode": "local_chromium",
+        "browserless_cloud_demo": {
+            "selected": False,
+            "configured": False,
+            "connection_status": "not_checked",
+            "last_connection_at": None,
+            "allowed_hosts": [],
+            "baseline_allowed_hosts": [],
+            "task_scoped_domain_authorization_supported": True,
+            "domain_authorization_scope": "UNBOUND per-task exact-host Playwright request interception; Browserless provider-level egress policy is not asserted",
+            "execution_configured": False,
+            "execution_available": False,
+            "containment_note": "Cloud browser demo uses application-level hostname/request restrictions; self-hosted Windows and Ubuntu containment gates remain independent and unverified.",
+        },
         "browser_deployment_mode": "development",
         "browser_protected_deployment_verified": False,
         "browser_deployment_acl_verified": False,
@@ -142,6 +182,18 @@ def test_application_starts_without_llm_credentials_and_health_is_honest(monkeyp
             "last_error_code": None,
         },
     }
+
+
+def test_task_api_does_not_route_public_research_to_local_document_search(tmp_path):
+    provider = FakeProvider([])
+    runtime = TaskRuntime(provider=provider, manager=TaskManager(SQLiteTaskRepository(tmp_path / "research-routing.sqlite3")))
+    register_search(runtime, [])
+    with TestClient(create_app(runtime)) as client:
+        response = client.post("/api/tasks", json={"user_request": "Research the latest AI agent developments on the public web"})
+        assert response.status_code == 422
+        assert response.json()["detail"]["code"] == "public_search_unavailable"
+        assert "Local document search cannot retrieve public sources" in response.json()["detail"]["message"]
+        assert runtime.manager.list_tasks() == []
 
 
 def test_s3_sync_routes_require_trusted_origin_confirmation_and_opt_in(monkeypatch):
@@ -378,6 +430,45 @@ def test_malformed_planner_response_is_explicit_not_an_empty_clarification_task(
     assert calls == []
 
 
+def test_task_api_reports_unsupported_browser_arguments_without_a_clarification_loop():
+    provider = FakeProvider([
+        task_execution_intent(),
+        TaskIntent(goal="Open the requested page and click the link", required_capabilities=["browser.navigate", "browser.click"]),
+        PlanDraft(steps=[TaskStep(
+            step_id="click_link",
+            tool_name="browser.click",
+            description="Click the requested page link",
+            input={
+                "target": {"type": "text", "value": "View details"},
+                "unsupported": "not a browser.click argument",
+            },
+            expected_outcome="The link is opened",
+        )]),
+    ])
+    runtime = TaskRuntime(provider=provider)
+    runtime.registry.register(
+        ToolDefinition(
+            tool_name="browser.click",
+            description="Click one element identified by a structured browser locator.",
+            input_schema=BrowserClickInput.model_json_schema(),
+        ),
+        BrowserClickInput,
+        lambda _arguments, _call: ToolResult(success=True, data={"verified": True}),
+    )
+    response = TestClient(create_app(runtime)).post(
+        "/api/tasks",
+        json={"user_request": "Open https://example.com and click the View details link", "auto_execute": False},
+    )
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail["code"] == "invalid_plan"
+    assert "unsupported arguments for 'browser.click'" in detail["message"]
+    assert "unsupported" in detail["message"]
+    assert "not a browser.click argument" not in response.text
+    assert runtime.manager.repository._tasks == {}
+
+
 def test_assistant_request_maps_invalid_structured_plan_to_safe_error_without_creating_task():
     class InvalidPlanProvider:
         def generate_json(self, *, response_model, **kwargs):
@@ -417,7 +508,9 @@ def test_assistant_request_valid_plan_is_prepared_without_execution():
     register_search(runtime, calls)
 
     response = TestClient(create_app(runtime)).post(
-        "/api/assistant/requests", json={"message": "Search synthetic quarterly reports"}
+        "/api/assistant/requests",
+        json={"message": "Search synthetic quarterly reports"},
+        headers={"Origin": "http://127.0.0.1:5178"},
     )
 
     assert response.status_code == 200

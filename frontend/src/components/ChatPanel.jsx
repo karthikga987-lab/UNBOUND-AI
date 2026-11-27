@@ -22,11 +22,13 @@ export default function ChatPanel({
   loading = false,
   conversationError = null,
   unavailableTaskCount = 0,
+  draftPrompt = null,
 }) {
-  const [text, setText] = useState('')
+  const [text, setText] = useState(draftPrompt?.text ?? '')
   const [sending, setSending] = useState(false)
   const [error, setError] = useState(null)
   const listRef = useRef(null)
+  const sendingRef = useRef(false)
 
   useEffect(() => {
     const el = listRef.current
@@ -34,6 +36,8 @@ export default function ChatPanel({
   }, [history.length])
 
   const send = useCallback(async (value) => {
+    if (sendingRef.current) return null
+    sendingRef.current = true
     setSending(true)
     setError(null)
     try {
@@ -42,6 +46,7 @@ export default function ChatPanel({
       setError(err)
       throw err
     } finally {
+      sendingRef.current = false
       setSending(false)
     }
   }, [onSubmit])
@@ -49,7 +54,7 @@ export default function ChatPanel({
   async function submit(event) {
     event?.preventDefault()
     const value = text.trim()
-    if (!value || sending || loading || !onSubmit) return
+    if (!value || sendingRef.current || sending || loading || !onSubmit) return
     try {
       await send(value)
       setText('')
@@ -169,7 +174,7 @@ export default function ChatPanel({
           className="w-full resize-y rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 focus:border-violet-500 focus:outline-none"
         />
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <p className="text-xs text-slate-500">Task plans are never run from a chat response. Review the plan and use Run plan separately.</p>
+          <p className="text-xs text-slate-500">For an action, UNBOUND prepares a reviewable plan below. Select Run plan to start it; planning alone does not execute anything.</p>
           <div className="flex items-center gap-2">
             <button
               type="button"
@@ -191,7 +196,14 @@ export default function ChatPanel({
             </Button>
           </div>
         </div>
-        {conversationError && <ErrorState error={conversationError} compact title="Conversation unavailable" />}
+        {conversationError && (
+          <div>
+            <ErrorState error={conversationError} compact title="Conversation unavailable" />
+            <p role="status" className="mt-2 text-xs text-amber-200">
+              Conversation history is unavailable. You can still submit a task; it will not be attached to conversation history.
+            </p>
+          </div>
+        )}
         {error && <ErrorState error={error} compact title="Could not send message" />}
       </form>
       {voice.active && (

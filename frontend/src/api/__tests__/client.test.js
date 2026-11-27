@@ -91,6 +91,15 @@ describe('realApi', () => {
     expect(error.status).toBe(503)
   })
 
+  it('preserves actionable Ollama HTTP 400 detail from assistant planning', async () => {
+    const message = "Ollama rejected request parameter 'reasoning_effort' (HTTP 400). Check compatibility with the configured local model service."
+    vi.stubGlobal('fetch', respond(503, { detail: { code: 'llm_provider_error', message } }))
+    const error = await realApi.assistantRequest('Search the web for the approved page').catch((value) => value)
+    expect(error).toBeInstanceOf(ApiError)
+    expect(error.message).toBe(message)
+    expect(error.code).toBe('llm_provider_error')
+  })
+
   it('reports a clear message when the backend is unreachable', async () => {
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('Failed to fetch')))
     await expect(realApi.health()).rejects.toThrow(/Cannot reach the backend/)

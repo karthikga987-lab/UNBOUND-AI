@@ -76,7 +76,7 @@ describe('LiveView', () => {
     expect(screen.getByRole('button', { name: /stop/i }).disabled).toBe(false)
   })
 
-  it('shows a real verified task observation without pretending a screenshot stream exists', () => {
+  it('keeps the verified observation separate when no live screenshot frame was received', () => {
     const observation = {
       url: 'http://unbound-demo.invalid/details',
       title: 'Demo Product details',
@@ -96,10 +96,21 @@ describe('LiveView', () => {
       }),
     })
     expect(screen.getByTestId('task-backed-browser-observation').textContent).toContain('Demo Product details')
-    expect(screen.getByTestId('task-backed-browser-observation').textContent).toContain('LOCAL DEMO MODE')
-    expect(screen.getByTestId('task-backed-browser-observation').textContent).toContain('public browsing disabled')
-    expect(screen.getByTestId('task-backed-browser-observation').textContent).toContain('no screenshot stream')
+    expect(screen.getByText(/LOCAL DEMO MODE/).textContent).toContain('public browsing disabled')
+    expect(screen.getByTestId('live-placeholder-unavailable')).toBeTruthy()
     expect(screen.queryByTestId('live-screenshot')).toBeNull()
+  })
+
+  it('shows the actual Browserless stage, page metadata and provider label from backend events', () => {
+    const { service } = renderLive()
+    service.push([liveEvent('page_loaded', {
+      url: 'https://example.com/',
+      description: 'Page loaded',
+      metadata: { stage: 'page_loaded', page_title: 'Example Domain', provider: 'browserless_cloud_demo' },
+    })])
+    expect(screen.getByTestId('browser-stage').textContent).toContain('Page loaded')
+    expect(screen.getAllByText('Example Domain').length).toBeGreaterThan(0)
+    expect(screen.getByTestId('live-provider').textContent).toContain('Browserless Cloud demo')
   })
 
   it('shows loading before the first screenshot, then renders and updates the live screen', () => {

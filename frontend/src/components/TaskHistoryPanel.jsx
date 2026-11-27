@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { api } from '../api'
 import { Card, EmptyState, ErrorState, LoadingState, StatusBadge } from './ui'
 
-export default function TaskHistoryPanel({ onSelect }) {
+export default function TaskHistoryPanel({ onSelect, active = false, compact = false }) {
   const [tasks, setTasks] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
@@ -21,19 +21,21 @@ export default function TaskHistoryPanel({ onSelect }) {
   }, [])
 
   useEffect(() => {
-    let active = true
+    let isCurrent = true
     api.listTasks(100).then((result) => {
-      if (active) setTasks(Array.isArray(result) ? result : [])
+      if (isCurrent) setTasks(Array.isArray(result) ? result : [])
     }).catch((err) => {
-      if (active) setError(err)
+      if (isCurrent) setError(err)
     }).finally(() => {
-      if (active) setLoading(false)
+      if (isCurrent) setLoading(false)
     })
-    return () => { active = false }
-  }, [])
+    return () => { isCurrent = false }
+  }, [active])
+
+  const visibleTasks = compact ? [...tasks].reverse().slice(0, 3) : [...tasks].reverse()
 
   return (
-    <Card title="Task history" subtitle="Saved task state is loaded from the backend.">
+    <Card title={compact ? null : 'Task history'} subtitle={compact ? undefined : 'Saved task state is loaded from the backend.'} className={compact ? 'compact-history-list' : ''}>
       {loading ? <LoadingState label="Loading task history…" /> : null}
       {!loading && error ? <ErrorState error={error} onRetry={load} title="Task history unavailable" /> : null}
       {!loading && !error && tasks.length === 0 ? (
@@ -41,12 +43,12 @@ export default function TaskHistoryPanel({ onSelect }) {
       ) : null}
       {!loading && !error && tasks.length > 0 ? (
         <ul className="space-y-2">
-          {[...tasks].reverse().map((task) => (
+          {visibleTasks.map((task) => (
             <li key={task.task_id}>
               <button
                 type="button"
                 onClick={() => onSelect(task.task_id)}
-                className="w-full rounded-lg border border-slate-800 bg-slate-950/70 p-3 text-left hover:border-violet-500/50"
+                className={`w-full rounded-lg border border-slate-800 bg-slate-950/70 p-3 text-left hover:border-violet-500/50 ${compact ? 'recent-task-row' : ''}`}
               >
                 <span className="flex items-center justify-between gap-2">
                   <span className="line-clamp-2 text-sm text-slate-200">{task.user_request}</span>

@@ -296,6 +296,19 @@ class BrowserController:
         except Exception as exc:
             raise BrowserControllerError("read title", str(exc), url=page.url) from exc
 
+    def screenshot_png(self, *, max_bytes: int = 1_000_000) -> bytes:
+        """Capture one bounded viewport screenshot from the active page."""
+        page = self._require_page("capture screenshot")
+        try:
+            image = page.screenshot(type="png", full_page=False, timeout=self.timeout_ms)
+            if not image or len(image) > max_bytes or not image.startswith(b"\x89PNG\r\n\x1a\n"):
+                raise BrowserControllerError("capture screenshot", "Screenshot is invalid or exceeds the size limit", url=page.url)
+            return image
+        except BrowserControllerError:
+            raise
+        except Exception as exc:
+            raise BrowserControllerError("capture screenshot", str(exc), url=page.url) from exc
+
     @staticmethod
     def _locator(page, target: LocatorTarget | Mapping[str, Any]):
         parsed = _parse_target(target)

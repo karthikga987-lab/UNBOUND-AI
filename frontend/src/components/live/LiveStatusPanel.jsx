@@ -19,9 +19,9 @@ function lastActivity(live, taskEvents) {
   return null
 }
 
-function Row({ label, children }) {
+function Row({ label, children, testId }) {
   return (
-    <div className="grid grid-cols-[7.5rem_1fr] gap-2 py-1.5 text-xs">
+    <div className="grid grid-cols-[7.5rem_1fr] gap-2 py-1.5 text-xs" data-testid={testId}>
       <dt className="text-slate-400">{label}</dt>
       <dd className="min-w-0 break-words text-slate-100">{children}</dd>
     </div>
@@ -51,6 +51,11 @@ export default function LiveStatusPanel({ task, taskEvents, live, displayStatus,
           <StatusBadge status={connectionStatus} />
           {live.page?.url && <span className="ml-2 break-all text-slate-400">{live.page.url}</span>}
         </Row>
+        <Row label="Browser stage" testId="browser-stage">
+          {stageLabel(live.executionStage?.stage) ?? live.executionStage?.description ?? 'Waiting for an execution event'}
+        </Row>
+        {live.pageTitle?.title && <Row label="Page title">{live.pageTitle.title}</Row>}
+        {live.provider?.name && <Row label="Provider"><span data-testid="live-provider">{providerLabel(live.provider.name)}</span></Row>}
         <Row label="Last activity">{activity ? `${formatTime(activity.time)} · ${activity.text}` : 'None yet'}</Row>
         <Row label="Verification">
           {verification ? (
@@ -75,4 +80,28 @@ export default function LiveStatusPanel({ task, taskEvents, live, displayStatus,
       )}
     </Card>
   )
+}
+
+function stageLabel(stage) {
+  return ({
+    connecting_to_browserless: 'Connecting to Browserless',
+    connecting_to_browser: 'Connecting to browser',
+    browser_session_created: 'Browser session created',
+    navigating_to_website: 'Navigating to website',
+    page_loaded: 'Page loaded',
+    extracting_content: 'Extracting content',
+    capturing_screenshot: 'Capturing screenshot',
+    screenshot_updated: 'Screenshot captured',
+    cancelled: 'Cancelled',
+    ai_summarizing: 'AI summarizing',
+    completed: 'Completed',
+    failed: 'Failed',
+    browser_session_closed: 'Browser session closed',
+  })[stage] ?? null
+}
+
+function providerLabel(provider) {
+  if (provider === 'browserless_cloud_demo') return 'Browserless Cloud demo · application-level restrictions'
+  if (provider === 'local_demo') return 'Local Demo · synthetic fixture'
+  return provider.replaceAll('_', ' ')
 }

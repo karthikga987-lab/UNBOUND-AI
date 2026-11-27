@@ -33,6 +33,9 @@ ALLOWED_BROWSER_ORIGINS = {
     "http://127.0.0.1:5173",
     "http://127.0.0.1:5174",
     "http://127.0.0.1:5175",
+    "http://127.0.0.1:5176",
+    "http://127.0.0.1:5177",
+    "http://127.0.0.1:5178",
 }
 MAX_REQUEST_BODY_BYTES = 1024 * 1024
 MAX_DOCUMENT_REQUEST_BODY_BYTES = 21 * 1024 * 1024

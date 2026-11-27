@@ -1,7 +1,8 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { api } from '../api'
 import { useTask } from '../hooks/useTask'
 import LiveView from './live/LiveView'
+import ActivityTimeline from './live/ActivityTimeline'
 import ResultPanel from './ResultPanel'
 import TimelinePanel from './TimelinePanel'
 import { Card, ErrorState, LoadingState } from './ui'
@@ -11,11 +12,12 @@ const VIEWS = [
   { id: 'live', label: 'Live View' },
 ]
 
-export default function TaskWorkspace({ taskId, onTaskChange }) {
+export default function TaskWorkspace({ taskId, onTaskChange, initialView = 'details' }) {
   const { task, events, error, refresh, setTask } = useTask(taskId)
   const [busy, setBusy] = useState(null)
   const [actionError, setActionError] = useState(null)
-  const [view, setView] = useState('details')
+  const [view, setView] = useState(initialView)
+  const executionInFlight = useRef(false)
 
   useEffect(() => {
     if (task) onTaskChange(task)
@@ -35,7 +37,14 @@ export default function TaskWorkspace({ taskId, onTaskChange }) {
     }
   }
 
-  const execute = () => run('execute', () => api.executeTask(taskId))
+  const execute = () => {
+    if (executionInFlight.current) return
+    executionInFlight.current = true
+    setView('live')
+    return run('execute', () => api.executeTask(taskId)).finally(() => {
+      executionInFlight.current = false
+    })
+  }
 
   const cancel = () => {
     if (window.confirm('Stop this task? Completed steps and evidence will be kept. An action already in progress may not be reversible.')) {
@@ -79,22 +88,21 @@ export default function TaskWorkspace({ taskId, onTaskChange }) {
       {view === 'live' ? (
         <LiveView task={task} taskEvents={events} busy={busy} actionError={actionError} onCancel={cancel} onDecide={decide} onBack={() => setView('details')} />
       ) : (
-        <div className="grid gap-4 2xl:grid-cols-5">
-          <div className="min-w-0 2xl:col-span-3">
-            <TimelinePanel
-              task={task}
-              events={events}
-              error={error}
-              busy={busy}
-              actionError={actionError}
-              onExecute={execute}
-              onCancel={cancel}
-              onDecide={decide}
-              onOpenLive={() => setView('live')}
-            />
-          </div>
-          <div className="min-w-0 2xl:col-span-2">
-            <ResultPanel task={task} />
+        <div className="space-y-4">
+          <TimelinePanel
+            task={task}
+            events={events}
+            error={error}
+            busy={busy}
+            actionError={actionError}
+            onExecute={execute}
+            onCancel={cancel}
+            onDecide={decide}
+            onOpenLive={() => setView('live')}
+          />
+          <div className="grid items-start gap-4 lg:grid-cols-2" data-testid="results-activity-grid">
+            <div className="min-w-0"><ResultPanel task={task} /></div>
+            <div className="min-w-0"><ActivityTimeline liveEvents={[]} taskEvents={events} /></div>
           </div>
         </div>
       )}

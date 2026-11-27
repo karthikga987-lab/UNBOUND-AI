@@ -35,6 +35,9 @@ def _chromium_binary_identity() -> tuple[str | None, str | None]:
 @router.get("/health")
 def health(request: Request) -> dict[str, object]:
     runtime = request.app.state.runtime
+    refresh_worker_health = getattr(runtime, "refresh_browser_worker_health", None)
+    if callable(refresh_worker_health):
+        refresh_worker_health()
     notification = runtime.get_notification_agent_status()
     proxy = runtime.browser_egress_proxy
     proxy_running = bool(proxy is not None and proxy.is_running)
@@ -52,8 +55,59 @@ def health(request: Request) -> dict[str, object]:
         "registered_tools_count": runtime.registered_tools_count(),
         "notification_agent_installed": notification["installed"],
         "notification_agent_running": notification["running"],
-        "browser_public_execution_enabled": runtime.browser_egress_security_enabled,
+        # Gate D requires a fresh signed guest-policy attestation. Gate E is
+        # still independently false until host OS egress enforcement passes.
+        "browser_public_execution_enabled": False,
+        "browser_worker": {
+            "installation": "configured" if runtime.browser_worker_configured else "unknown",
+            "service": "authenticated" if runtime.browser_worker_authenticated else "unknown",
+            "connection": "reachable" if runtime.browser_worker_reachable else "untested",
+            "guest_proxy": "configured" if runtime.browser_worker_authenticated else "unavailable",
+            "readiness_gates": {
+                "A": "NOT TESTED", "B": "NOT TESTED", "C": "NOT TESTED",
+                "D": "PASS" if runtime.browser_worker_guest_policy_verified else "FAIL",
+                "E": "FAIL", "F": "FAIL",
+                "G": "NOT TESTED", "H": "NOT TESTED", "I": "FAIL",
+            },
+            "configured": runtime.browser_worker_configured,
+            "reachable": runtime.browser_worker_reachable,
+            "authenticated": runtime.browser_worker_authenticated,
+            "containment_verified": runtime.browser_worker_containment_verified,
+            "guest_policy_verified": runtime.browser_worker_guest_policy_verified,
+            "guest_policy_failure": runtime.browser_worker_guest_policy_failure,
+            "guest_policy_attestation": {
+                "policy_version": runtime.browser_worker_guest_policy_version,
+                "policy_sha256": runtime.browser_worker_guest_policy_sha256,
+                "boot_id": runtime.browser_worker_guest_policy_boot_id,
+                "observed_at": runtime.browser_worker_guest_policy_observed_at,
+            } if runtime.browser_worker_guest_policy_verified else None,
+            "execution_enabled": runtime.browser_worker_execution_enabled,
+            "worker_id": runtime.browser_worker_id,
+            "last_health_check": runtime.browser_worker_last_health_check,
+            "failure_category": runtime.browser_worker_failure_category,
+            "allowed_domains": ["example.com", "www.python.org", "docs.python.org"],
+            "fetch_gateway_active": runtime.browser_fetch_gateway_server is not None,
+            "public_browsing_enabled": False,
+        },
         "browser_integration_status": runtime.browser_integration_status,
+        "browser_provider_mode": runtime.browser_provider_mode,
+        "browserless_cloud_demo": {
+            "selected": runtime.browser_provider_mode == "browserless_cloud_demo",
+            "configured": runtime.browserless_configured,
+            "connection_status": runtime.browserless_connection_status,
+            "last_connection_at": runtime.browserless_last_connection_at,
+            "allowed_hosts": list(runtime.browserless_allowed_hosts),
+            "baseline_allowed_hosts": list(runtime.browserless_allowed_hosts),
+            "task_scoped_domain_authorization_supported": True,
+            "domain_authorization_scope": "UNBOUND per-task exact-host Playwright request interception; Browserless provider-level egress policy is not asserted",
+            "execution_configured": bool(
+                runtime.browser_provider_mode == "browserless_cloud_demo"
+                and runtime.browserless_configured
+                and runtime.browser_tools_registered
+            ),
+            "execution_available": runtime.browserless_connection_status == "connected",
+            "containment_note": "Cloud browser demo uses application-level hostname/request restrictions; self-hosted Windows and Ubuntu containment gates remain independent and unverified.",
+        },
         "browser_deployment_mode": runtime.browser_deployment_mode,
         "browser_protected_deployment_verified": runtime.browser_protected_deployment_verified,
         "browser_deployment_acl_verified": runtime.browser_deployment_acl_verified,
@@ -94,9 +148,6 @@ def health(request: Request) -> dict[str, object]:
         # containment signal. Keep it explicitly false until such a policy
         # is installed and verified outside application-level tests.
         "browser_process_containment_verified": False,
-        "browser_public_execution_status": (
-            "enabled_verified" if runtime.browser_egress_security_enabled
-            else "blocked_missing_process_containment"
-        ),
+        "browser_public_execution_status": "blocked_missing_process_containment",
         "s3_sync": runtime.s3_sync_status(),
     }

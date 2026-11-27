@@ -17,6 +17,7 @@ from backend.app.documents.store import DocumentStore
 from backend.app.main import create_app
 from backend.app.schemas.contracts import (
     ApprovalRequest,
+    EventStatus,
     TaskCreateRequest,
     TaskStep,
     TaskStatus,
@@ -46,8 +47,15 @@ def _set_valid_key(monkeypatch):
 def test_application_startup_registers_six_gated_browser_tools_and_preserves_documents(tmp_path, monkeypatch):
     _set_valid_key(monkeypatch)
     # This startup test exercises the offline fixture and does not need a
-    # public DNS resolver configuration.
+    # public DNS resolver configuration. Use an isolated port because a live
+    # application proxy may already own the production default during tests.
+    import socket
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        proxy_port = probe.getsockname()[1]
     monkeypatch.setenv("UNBOUND_BROWSER_LOCAL_DEMO", "1")
+    monkeypatch.setenv("UNBOUND_BROWSER_EGRESS_PORT", str(proxy_port))
     monkeypatch.setenv("UNBOUND_DOCUMENT_IMPORT_DIR", str(tmp_path / "imports"))
     runtime = TaskRuntime(
         document_store=DocumentStore(tmp_path / "documents"),
@@ -81,7 +89,7 @@ def test_application_startup_registers_six_gated_browser_tools_and_preserves_doc
         assert status["browser_egress_proxy_identity_verified"] is True
         assert status["browser_egress_proxy_validation_working"] is True
         assert status["browser_egress_proxy_endpoint"].startswith("http://127.0.0.1:")
-        assert status["browser_egress_proxy_endpoint"] == "http://127.0.0.1:18765"
+        assert status["browser_egress_proxy_endpoint"] == f"http://127.0.0.1:{proxy_port}"
         assert status["browser_egress_proxy_executable"].endswith("unbound-egress-proxy.exe")
         assert len(status["browser_egress_proxy_sha256"]) == 64
         assert status["browser_chromium_executable"].endswith("chrome.exe")
@@ -99,9 +107,169 @@ def test_application_startup_registers_six_gated_browser_tools_and_preserves_doc
         assert status["browser_proxy_shutdown_fail_closed_verified"] is False
         assert status["browser_process_containment_verified"] is False
         assert status["browser_public_execution_enabled"] is False
+        assert status["browser_worker"] == {
+            "installation": "unknown", "service": "unknown", "connection": "untested",
+            "guest_proxy": "unavailable",
+            "readiness_gates": {"A": "NOT TESTED", "B": "NOT TESTED", "C": "NOT TESTED",
+                                "D": "FAIL", "E": "FAIL", "F": "FAIL",
+                                "G": "NOT TESTED", "H": "NOT TESTED", "I": "FAIL"},
+            "configured": False,
+            "reachable": False,
+            "authenticated": False,
+            "containment_verified": False,
+            "guest_policy_verified": False,
+            "guest_policy_failure": "guest_policy_attestation_missing",
+            "guest_policy_attestation": None,
+            "execution_enabled": False,
+            "worker_id": None,
+            "last_health_check": None,
+            "failure_category": "local_demo_mode",
+            "allowed_domains": ["example.com", "www.python.org", "docs.python.org"],
+            "fetch_gateway_active": False,
+            "public_browsing_enabled": False,
+        }
         proxy = runtime.browser_egress_proxy
 
     assert not proxy.is_running
+
+
+def test_healthy_remote_worker_stays_disabled_without_independent_containment(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import backend.app.browser.worker_runtime as worker_runtime
+
+    class HealthyClient:
+        enabled = True
+        worker_id = "synthetic-worker"
+
+        def health(self):
+            return SimpleNamespace(ready=True, browser_available=True, proxy_configured=True)
+
+    class Gateway:
+        def fetch(self, _url):
+            raise AssertionError("verification is not invoked during startup")
+
+    class GatewayHandle:
+        def close(self):
+            pass
+
+    monkeypatch.setenv("UNBOUND_BROWSER_EXECUTION_MODE", "isolated-worker")
+    monkeypatch.setenv("UNBOUND_WORKER_IDENTITY_DIRECTORY", str(tmp_path / "synthetic-identities"))
+    monkeypatch.setenv("UNBOUND_FETCH_GATEWAY_ENABLED", "1")
+    # No setting, including a user-supplied opt-in, can attest OS containment.
+    monkeypatch.setenv("UNBOUND_BROWSER_PUBLIC_BROWSING_ENABLED", "1")
+    monkeypatch.setattr(worker_runtime, "build_worker_client", lambda _directory: HealthyClient())
+    monkeypatch.setattr(
+        worker_runtime,
+        "start_fetch_gateway",
+        lambda _directory: (GatewayHandle(), Gateway()),
+    )
+
+    runtime = TaskRuntime()
+    runtime.initialize_browser_worker()
+
+    assert runtime.browser_worker_configured is True
+    assert runtime.browser_worker_reachable is True
+    assert runtime.browser_worker_authenticated is True
+    assert runtime.browser_worker_containment_verified is False
+    assert runtime.browser_worker_execution_enabled is False
+    assert runtime.browser_worker_public_browsing_enabled is False
+    assert runtime.browser_worker_failure_category == "containment_unverified"
+    assert runtime.browser_worker_dispatcher is not None
+    assert runtime.browser_worker_dispatcher.enabled is False
+    assert runtime.executor.remote_browser_selected is True
+
+
+def test_external_gateway_mode_does_not_bind_inside_fastapi(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import backend.app.browser.worker_runtime as worker_runtime
+
+    class HealthyClient:
+        worker_id = "synthetic-worker"
+
+        def health(self):
+            return SimpleNamespace(ready=True, browser_available=True, proxy_configured=True)
+
+    monkeypatch.setenv("UNBOUND_BROWSER_EXECUTION_MODE", "isolated-worker")
+    monkeypatch.setenv("UNBOUND_WORKER_IDENTITY_DIRECTORY", str(tmp_path / "synthetic-identities"))
+    monkeypatch.setenv("UNBOUND_FETCH_GATEWAY_ENABLED", "1")
+    monkeypatch.setenv("UNBOUND_FETCH_GATEWAY_MODE", "external")
+    monkeypatch.setattr(worker_runtime, "build_worker_client", lambda _directory: HealthyClient())
+    monkeypatch.setattr(worker_runtime, "start_fetch_gateway", lambda _directory: (_ for _ in ()).throw(AssertionError("in-process gateway started")))
+
+    runtime = TaskRuntime()
+    runtime.initialize_browser_worker()
+    assert runtime.browser_worker_authenticated is True
+    assert runtime.browser_fetch_gateway_server is None
+    assert runtime.browser_worker_execution_enabled is False
+    assert runtime.browser_worker_public_browsing_enabled is False
+    assert runtime.browser_worker_failure_category == "external_gateway_containment_unverified"
+    assert runtime.executor.remote_browser_selected is True
+
+
+def test_health_refreshes_signed_guest_policy_evidence_but_keeps_public_execution_disabled(monkeypatch):
+    import time
+    from uuid import uuid4
+    from backend.app.browser.worker_protocol import (
+        GUEST_POLICY_SHA256, GUEST_POLICY_VERSION, GuestPolicyAttestation,
+        GuestPolicyChecks, WorkerHealth,
+    )
+
+    worker_id = "unbound-ubuntu-worker"
+    challenge_id = uuid4()
+    attestation = GuestPolicyAttestation(
+        request_id=challenge_id, worker_id=worker_id, boot_id=uuid4(),
+        policy_version=GUEST_POLICY_VERSION, policy_sha256=GUEST_POLICY_SHA256,
+        observed_at=int(time.time()),
+        checks=GuestPolicyChecks(**{name: True for name in GuestPolicyChecks.model_fields}),
+    )
+
+    class Client:
+        def __init__(self):
+            self.calls = 0
+
+        def health(self):
+            self.calls += 1
+            return WorkerHealth(
+                request_id=challenge_id, challenge=f"challenge-{self.calls}",
+                worker_id=worker_id, ready=True, browser_available=True,
+                proxy_configured=True, guest_policy_attestation=attestation,
+            )
+
+    monkeypatch.setenv("UNBOUND_BROWSER_EXECUTION_MODE", "local-demo")
+    runtime = TaskRuntime()
+    application = create_app(runtime)
+    with TestClient(application) as client:
+        probe = Client()
+        runtime.browser_worker_client = probe
+        runtime.browser_worker_id = worker_id
+        runtime.browser_worker_configured = True
+        monkeypatch.setenv("UNBOUND_BROWSER_EXECUTION_MODE", "isolated-worker")
+        response = client.get("/api/health")
+        status = response.json()["browser_worker"]
+        assert probe.calls == 1
+        assert status["readiness_gates"]["D"] == "PASS"
+        assert status["guest_policy_verified"] is True
+        assert status["guest_policy_attestation"]["policy_version"] == GUEST_POLICY_VERSION
+        assert status["readiness_gates"]["E"] == "FAIL"
+        assert status["execution_enabled"] is False
+        assert status["public_browsing_enabled"] is False
+
+
+def test_health_refresh_failure_revokes_guest_policy_status(monkeypatch):
+    monkeypatch.setenv("UNBOUND_BROWSER_EXECUTION_MODE", "isolated-worker")
+
+    class Client:
+        def health(self):
+            raise RuntimeError("synthetic health failure")
+
+    runtime = TaskRuntime()
+    runtime.browser_worker_client = Client()
+    runtime.browser_worker_guest_policy_verified = True
+    runtime.refresh_browser_worker_health(cache_seconds=0)
+    assert runtime.browser_worker_reachable is False
+    assert runtime.browser_worker_authenticated is False
+    assert runtime.browser_worker_guest_policy_verified is False
+    assert runtime.browser_worker_failure_category == "worker_health_failed"
 
 
 def test_runtime_honors_configured_proxy_port_in_local_demo(tmp_path, monkeypatch):
@@ -333,3 +501,53 @@ def test_public_task_api_redacts_replay_parameters_and_authorization(tmp_path, m
     }
     assert payload["pending_approvals"][0]["arguments"] == {}
     assert payload["pending_approvals"][0]["description"] == "A browser workflow action requires approval."
+
+
+def test_terminal_browser_cleanup_is_idempotent_after_confirmed_close():
+    from types import SimpleNamespace
+
+    runtime = TaskRuntime()
+    task = runtime.manager.create(
+        TaskCreateRequest(user_request="Open a browser page"),
+        [TaskStep(
+            step_id="open", tool_name="browser.navigate", description="Open example.com",
+            input={"url": "https://example.com/"}, expected_outcome="Page is observed",
+        )],
+    )
+    session_id = uuid4()
+    runtime.manager.record_execution_event(
+        task.task_id, "browser.launch_completed", EventStatus.RUNNING,
+        "Task-scoped browser session launched", step_id="open", tool_name="browser.navigate",
+        browser_session_id=str(session_id), provider_session_id="provider-session",
+    )
+
+    binding = SimpleNamespace(
+        session_id=session_id,
+        controller=SimpleNamespace(provider_session_id="provider-session", is_started=False),
+    )
+
+    class Sessions:
+        def __init__(self):
+            self.first = True
+
+        def get_session(self, _task_id):
+            if self.first:
+                self.first = False
+                return binding
+            return None
+
+        def close_task_session(self, _task_id):
+            return True
+
+    class Adapter:
+        def cleanup_task(self, _task_id):
+            pass
+
+    runtime.browser_session_manager = Sessions()
+    runtime.browser_tool_adapter = Adapter()
+    runtime._cleanup_browser_task(task.task_id, TaskStatus.COMPLETED)
+    runtime._cleanup_browser_task(task.task_id, TaskStatus.COMPLETED)
+
+    lifecycle = [event.event_type for event in runtime.manager.events(task.task_id)
+                 if event.event_type.startswith("browser.termination_")]
+    assert lifecycle == ["browser.termination_started", "browser.termination_completed"]

@@ -1,0 +1,16 @@
+[Unit]
+Description=UNBOUND guest host-only network policy
+Wants=network-online.target
+After=network-online.target
+Before=unbound-browser-worker.service
+AssertPathExists=/opt/unbound-gate-a/workers/ubuntu/host-only-review.nft
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh /opt/unbound-gate-a/workers/ubuntu/install-host-only-policy.sh
+# Keep the default-drop policy installed when this unit stops. Removing it
+# while any dependent process is alive would reopen guest networking.
+
+[Install]
+WantedBy=multi-user.target

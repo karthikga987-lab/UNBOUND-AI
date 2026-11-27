@@ -1,0 +1,38 @@
+[Unit]
+Description=UNBOUND offline fixture renderer
+PartOf=unbound-browser-worker.service
+Before=unbound-browser-worker.service
+
+[Service]
+Type=simple
+User=unbound-renderer
+Group=unbound-ipc
+UMask=0077
+RuntimeDirectory=unbound-renderer
+RuntimeDirectoryMode=0750
+WorkingDirectory=/opt/unbound-gate-a
+Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/unbound-gate-a/chromium
+Environment=HOME=/tmp
+EnvironmentFile=-/etc/unbound-renderer.env
+ExecStart=/opt/unbound-gate-a/.venv-worker/bin/python -Es -m backend.app.browser.worker_ipc
+PrivateNetwork=true
+IPAddressDeny=any
+RestrictAddressFamilies=AF_UNIX
+InaccessiblePaths=-/etc/unbound-browser-worker -/var/lib/unbound-browser-worker -/run/credentials
+ProtectProc=invisible
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+CPUQuota=100%
+MemoryMax=2G
+TasksMax=256
+TimeoutStopSec=20
+KillMode=control-group

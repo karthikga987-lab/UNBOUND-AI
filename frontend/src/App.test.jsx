@@ -82,21 +82,93 @@ afterEach(() => {
 })
 
 describe('React assistant chat routing', () => {
+  it('labels Browserless baseline hosts separately from per-task reviewed hosts', async () => {
+    state.api.health.mockResolvedValue({
+      status: 'ok',
+      browserless_cloud_demo: {
+        selected: true,
+        configured: true,
+        connection_status: 'closed',
+        allowed_hosts: ['example.com', 'docs.python.org'],
+        baseline_allowed_hosts: ['example.com', 'docs.python.org'],
+        task_scoped_domain_authorization_supported: true,
+      },
+    })
+    const { container } = render(<App />)
+    await waitFor(() => expect(container.querySelector('.browser-agent-card small')?.textContent).toBe(
+      'Browserless Cloud · 2 baseline host(s) · per-task review required',
+    ))
+  })
+
+  it('does not claim dynamic authorization when the backend lacks its capability flag', async () => {
+    state.api.health.mockResolvedValue({
+      status: 'ok',
+      browserless_cloud_demo: {
+        selected: true,
+        configured: true,
+        connection_status: 'closed',
+        allowed_hosts: ['example.com', 'docs.python.org'],
+      },
+    })
+    const { container } = render(<App />)
+    await waitFor(() => expect(container.querySelector('.browser-agent-card small')?.textContent).toBe(
+      'Browserless Cloud · 2 baseline host(s) · per-task authorization unavailable',
+    ))
+  })
+
+  it('draws a pointer-positioned liquid glass ripple on an interactive button', async () => {
+    render(<App />)
+    const button = await screen.findByRole('button', { name: 'History' })
+    fireEvent.pointerDown(button, { button: 0, clientX: 64, clientY: 80, pointerType: 'touch' })
+    const ripple = button.querySelector('.liquid-water-ripple')
+    expect(ripple).toBeTruthy()
+    expect(ripple.style.left).toBe('64px')
+    expect(ripple.style.top).toBe('80px')
+  })
+
+  it('keeps public browsing disabled when a worker is reachable', async () => {
+    state.api.health.mockResolvedValueOnce({
+      status: 'ok', browser_integration_status: 'local_demo_only',
+      browser_public_execution_enabled: true, browser_worker: { reachable: true },
+    })
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Settings' }))
+    const summary = await screen.findByText('Self-hosted worker and security gates')
+    fireEvent.click(summary)
+    expect(screen.getByText('Local Demo available')).toBeTruthy()
+    expect(screen.getByText('Ubuntu installation: unknown')).toBeTruthy()
+    expect(screen.getByText('Worker authentication: unverified')).toBeTruthy()
+    expect(screen.getByText('Public browsing')).toBeTruthy()
+    expect(screen.getByText('Disabled')).toBeTruthy()
+    expect(screen.getAllByText('Not configured')).toHaveLength(2)
+  })
+
   it('loads persisted task history and opens a selected task', async () => {
-    state.api.listTasks.mockResolvedValueOnce([{
+    state.api.listTasks.mockResolvedValueOnce([]).mockResolvedValueOnce([{
       task_id: 'stored-task-1',
       user_request: 'Analyze the synthetic report',
       status: 'completed',
       updated_at: '2026-11-25T10:00:00Z',
     }])
     render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: 'History' }))
     await screen.findByRole('button', { name: /Analyze the synthetic report/i })
     fireEvent.click(screen.getByRole('button', { name: /Analyze the synthetic report/i }))
     expect((await screen.findByTestId('task-workspace')).textContent).toContain('stored-task-1')
     expect(state.api.listTasks).toHaveBeenCalledWith(100)
+    expect(state.api.listTasks).toHaveBeenCalledTimes(2)
   })
 
-  it('restores a session and routes ordinary questions through the persistent conversation API without creating a task', async () => {
+  it('opens a navigation view and prefills quick actions in the chat composer', async () => {
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Browser' }))
+    expect(await screen.findByText('Choose a task to inspect')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Chat' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Capture & Extract' }))
+    await waitFor(() => expect(screen.getByPlaceholderText(/ask a question/i).value).toContain('https://example.com'))
+  })
+
+  it('restores a session and routes ordinary questions through the single assistant decision endpoint', async () => {
     window.localStorage.setItem('unbound.conversation_id', session.session_id)
     render(<App />)
 
@@ -106,9 +178,9 @@ describe('React assistant chat routing', () => {
 
     expect(await screen.findByText(/independent check/i)).toBeTruthy()
     expect(state.api.getConversation).toHaveBeenCalledWith(session.session_id)
-    expect(state.api.classifyAssistantRequest).toHaveBeenCalledWith('How does UNBOUND verify a task result?', session.session_id)
-    expect(state.api.sendConversationMessage).toHaveBeenCalledWith(session.session_id, 'How does UNBOUND verify a task result?', expect.any(String))
-    expect(state.api.assistantRequest).not.toHaveBeenCalled()
+    expect(state.api.assistantRequest).toHaveBeenCalledWith('How does UNBOUND verify a task result?', session.session_id)
+    expect(state.api.classifyAssistantRequest).not.toHaveBeenCalled()
+    expect(state.api.sendConversationMessage).not.toHaveBeenCalled()
     expect(state.api.createTask).not.toHaveBeenCalled()
     expect(state.api.executeTask).not.toHaveBeenCalled()
   })
@@ -128,10 +200,6 @@ describe('React assistant chat routing', () => {
       reply: 'Task plan is ready. Nothing has been executed.',
       task,
     })
-    state.api.classifyAssistantRequest.mockResolvedValueOnce({
-      category: 'action_execution',
-      current_turn_authorizes_execution: true,
-    })
     render(<App />)
 
     const input = await screen.findByPlaceholderText(/ask a question/i)
@@ -145,7 +213,6 @@ describe('React assistant chat routing', () => {
   })
 
   it('keeps backend errors visible and leaves the unsent text in the composer', async () => {
-    state.api.classifyAssistantRequest.mockResolvedValueOnce({ category: 'action_execution', current_turn_authorizes_execution: true })
     state.api.assistantRequest.mockRejectedValueOnce(new Error('The local model is unavailable'))
     render(<App />)
 
@@ -155,6 +222,57 @@ describe('React assistant chat routing', () => {
 
     expect((await screen.findByRole('alert')).textContent).toContain('The local model is unavailable')
     await waitFor(() => expect(input.value).toBe('Explain the local model status.'))
+  })
+
+  it('shows a specific provider rejection from the assistant endpoint without retrying another model', async () => {
+    state.api.assistantRequest.mockRejectedValueOnce(new Error("Ollama rejected request parameter 'reasoning_effort' (HTTP 400). Check compatibility with the configured local model service."))
+    render(<App />)
+    const input = await screen.findByPlaceholderText(/ask a question/i)
+    fireEvent.change(input, { target: { value: 'Search the web for the approved page' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    expect((await screen.findByRole('alert')).textContent).toContain("reasoning_effort")
+    expect(state.api.classifyAssistantRequest).not.toHaveBeenCalled()
+    expect(state.api.assistantRequest).toHaveBeenCalledTimes(1)
+  })
+
+  it('prepares a task without a restored conversation session', async () => {
+    state.api.createConversation.mockRejectedValueOnce(Object.assign(new Error('Browser origin is not allowed'), { status: 403 }))
+    state.api.assistantRequest.mockResolvedValueOnce({
+      intent: { category: 'action_execution' },
+      reply: 'Task plan is ready. Nothing has been executed.',
+      task: { task_id: 'stateless-task', status: 'created', pending_approvals: [], plan: [] },
+    })
+    render(<App />)
+
+    const input = await screen.findByPlaceholderText(/ask a question/i)
+    expect(await screen.findByText(/you can still submit a task/i)).toBeTruthy()
+    fireEvent.change(input, { target: { value: 'Open the approved page and summarize it.' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    expect((await screen.findByTestId('task-workspace')).textContent).toContain('stateless-task')
+    expect(state.api.classifyAssistantRequest).not.toHaveBeenCalled()
+    expect(state.api.assistantRequest).toHaveBeenCalledWith('Open the approved page and summarize it.', null)
+    expect(state.api.sendConversationMessage).not.toHaveBeenCalled()
+    expect(state.api.executeTask).not.toHaveBeenCalled()
+  })
+
+  it('uses a stateless assistant response instead of a missing conversation endpoint', async () => {
+    state.api.createConversation.mockRejectedValueOnce(Object.assign(new Error('Conversation storage unavailable'), { status: 503 }))
+    state.api.assistantRequest.mockResolvedValueOnce({
+      intent: { category: 'information' },
+      reply: 'A stateless answer from the assistant API.',
+      task: null,
+    })
+    render(<App />)
+
+    const input = await screen.findByPlaceholderText(/ask a question/i)
+    fireEvent.change(input, { target: { value: 'What can UNBOUND do?' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    expect(await screen.findByText('A stateless answer from the assistant API.')).toBeTruthy()
+    expect(state.api.assistantRequest).toHaveBeenCalledWith('What can UNBOUND do?', null)
+    expect(state.api.sendConversationMessage).not.toHaveBeenCalled()
   })
 
   it('restores the latest task associated with a conversation after a page reload', async () => {
@@ -222,7 +340,6 @@ describe('React assistant chat routing', () => {
     state.api.decideApproval.mockResolvedValueOnce({
       task_id: 'file-task', status: 'created', pending_approvals: [], plan: [],
     })
-    state.api.classifyAssistantRequest.mockResolvedValueOnce({ category: 'action_execution' })
     state.api.assistantRequest.mockResolvedValueOnce({
       intent: { category: 'action_execution' },
       reply: 'Browser task is prepared.',
